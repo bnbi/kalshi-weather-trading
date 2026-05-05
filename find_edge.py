@@ -1,0 +1,216 @@
+"""
+Edge Calculator
+Compares model probabilities to Kalshi market prices to find profitable trades.
+
+A trade has positive expected value when:
+    model_probability - market_price > spread_cost + min_edge
+
+This script ties everything together:
+1. Fetches current Kalshi markets for a city
+2. Gets the NWS forecast
+3. Runs the probability model
+4. Compares to market prices
+5. Outputs recommended trades
+"""
+
+import requests
+from dataclasses import dataclass
+
+from weather import CITIES
+from model import predict_all_for_city, ContractPrediction
+
+
+BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
+
+
+@dataclass
+class TradeSignal:
+    """A potential trade identified by the edge calculator."""
+    ticker: str
+    side: str              # 'yes' or 'no'
+    action: str            # always 'buy' for now
+    model_prob: float      # our probability of YES
+    market_price: float    # best price to buy (in dollars)
+    edge: float            # model_prob - market_price (if buying yes)
+    expected_value: float  # edge * notional
+    description: str
+
+
+def get_market_prices(series_ticker: str) -> list[dict]:
+    """Fetch current markets and prices for a series."""
+    resp = requests.get(f"{BASE_URL}/markets", params={
+        "limit": 200,
+        "status": "open",
+        "series_ticker": series_ticker,
+    })
+    resp.raise_for_status()
+    return resp.json().get("markets", [])
+
+
+def calculate_edge(predictions: list[ContractPrediction],
+                   markets: list[dict],
+                   min_edge: float = 0.05) -> list[TradeSignal]:
+    """
+    Find trades where our model disagrees with the market by more than min_edge.
+
+    min_edge: minimum edge (in dollars) required to signal a trade.
+              0.05 = 5 cents = 5% edge minimum.
+    """
+    # Build a lookup of market prices by ticker
+    market_lookup = {}
+    for m in markets:
+        ticker = m.get("ticker", "")
+        market_lookup[ticker] = {
+            "yes_ask": parse_price(m.get("yes_ask_dollars", m.get("yes_ask"))),
+            "no_ask": parse_price(m.get("no_ask_dollars", m.get("no_ask"))),
+            "last_price": parse_price(m.get("last_price_dollars", m.get("last_price"))),
+            "title": m.get("title", ""),
+            "volume": m.get("volume_fp", m.get("volume", "0")),
+        }
+
+    signals = []
+
+    for pred in predictions:
+        market = market_lookup.get(pred.ticker)
+        if not market:
+            continue
+
+        yes_ask = market["yes_ask"]
+        no_ask = market["no_ask"]
+
+        if yes_ask is None or no_ask is None:
+            continue
+
+        # Skip already-settled contracts (both sides at extreme prices)
+        if (yes_ask <= 0.02 and no_ask >= 0.98) or (yes_ask >= 0.98 and no_ask <= 0.02):
+            continue
+
+        # Edge on buying YES: we think P(yes) = model_prob, market charges yes_ask
+        # EV of buying yes = model_prob * $1 - yes_ask
+        yes_edge = pred.model_probability - yes_ask
+
+        # Edge on buying NO: we think P(no) = 1 - model_prob, market charges no_ask
+        # EV of buying no = (1 - model_prob) * $1 - no_ask
+        no_edge = (1 - pred.model_probability) - no_ask
+
+        # Signal a trade if edge exceeds threshold
+        if yes_edge >= min_edge:
+            signals.append(TradeSignal(
+                ticker=pred.ticker,
+                side="yes",
+                action="buy",
+                model_prob=pred.model_probability,
+                market_price=yes_ask,
+                edge=yes_edge,
+                expected_value=yes_edge,  # per $1 notional
+                description=f"BUY YES @ ${yes_ask:.2f} | Model: {pred.model_probability:.1%} | {pred.description}",
+            ))
+
+        if no_edge >= min_edge:
+            signals.append(TradeSignal(
+                ticker=pred.ticker,
+                side="no",
+                action="buy",
+                model_prob=1 - pred.model_probability,
+                market_price=no_ask,
+                edge=no_edge,
+                expected_value=no_edge,
+                description=f"BUY NO @ ${no_ask:.2f} | Model: {1 - pred.model_probability:.1%} | {pred.description}",
+            ))
+
+    # Sort by edge (best opportunities first)
+    signals.sort(key=lambda s: s.edge, reverse=True)
+    return signals
+
+
+def parse_price(price_str) -> float:
+    """Parse a price string like '0.4300' into a float."""
+    if price_str is None:
+        return None
+    try:
+        return float(price_str)
+    except (ValueError, TypeError):
+        return None
+
+
+def print_signals(signals: list[TradeSignal], city_name: str):
+    """Pretty-print trade signals."""
+    print(f"\n{'=' * 80}")
+    print(f"  TRADE SIGNALS — {city_name}")
+    print(f"{'=' * 80}")
+
+    if not signals:
+        print("  No trades with sufficient edge found.")
+        print("  (This is normal — the market is often efficient.)")
+        return
+
+    print(f"\n  Found {len(signals)} potential trade(s):\n")
+    print(f"  {'Ticker':<45} {'Side':<5} {'Edge':<8} {'EV/contract'}")
+    print(f"  {'-' * 75}")
+
+    for s in signals:
+        print(f"  {s.ticker:<45} {s.side:<5} {s.edge:>+5.1%}  ${s.expected_value:.2f}")
+        print(f"    {s.description}")
+        print()
+
+
+def print_full_comparison(predictions: list[ContractPrediction], markets: list[dict]):
+    """Print a full comparison table of model vs market."""
+    market_lookup = {m["ticker"]: m for m in markets}
+
+    print(f"\n  {'Ticker':<40} {'Model':<8} {'Mkt Yes':<9} {'Mkt No':<9} {'Edge(Y)':<9} {'Edge(N)'}")
+    print(f"  {'-' * 90}")
+
+    for pred in sorted(predictions, key=lambda p: p.ticker):
+        m = market_lookup.get(pred.ticker, {})
+        yes_ask = parse_price(m.get("yes_ask_dollars", m.get("yes_ask")))
+        no_ask = parse_price(m.get("no_ask_dollars", m.get("no_ask")))
+
+        yes_edge = (pred.model_probability - yes_ask) if yes_ask else None
+        no_edge = ((1 - pred.model_probability) - no_ask) if no_ask else None
+
+        yes_str = f"${yes_ask:.2f}" if yes_ask else "?"
+        no_str = f"${no_ask:.2f}" if no_ask else "?"
+        ye_str = f"{yes_edge:>+5.1%}" if yes_edge else "  ?"
+        ne_str = f"{no_edge:>+5.1%}" if no_edge else "  ?"
+
+        # Highlight positive edges
+        marker = " <--" if (yes_edge and yes_edge > 0.05) or (no_edge and no_edge > 0.05) else ""
+
+        print(f"  {pred.ticker:<40} {pred.model_probability:>5.1%}   {yes_str:<8} {no_str:<8} "
+              f"{ye_str:<8} {ne_str}{marker}")
+
+
+# ── Main ────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Find trading edges in weather contracts")
+    parser.add_argument("city", choices=list(CITIES.keys()), help="City to analyze")
+    parser.add_argument("--min-edge", type=float, default=0.05,
+                        help="Minimum edge to signal (default 0.05 = 5 cents)")
+    parser.add_argument("--show-all", action="store_true",
+                        help="Show full model vs market comparison")
+    args = parser.parse_args()
+
+    city = CITIES[args.city]
+
+    # Step 1: Fetch markets
+    print(f"Fetching {city.name} weather markets...")
+    markets = get_market_prices(city.kalshi_series)
+    print(f"  Found {len(markets)} open markets")
+
+    # Step 2: Generate predictions
+    print(f"\nFetching NWS forecast and computing probabilities...")
+    predictions = predict_all_for_city(args.city, markets)
+    print(f"  Generated {len(predictions)} predictions")
+
+    # Step 3: Find edges
+    signals = calculate_edge(predictions, markets, min_edge=args.min_edge)
+    print_signals(signals, city.name)
+
+    # Step 4: Optionally show full comparison
+    if args.show_all:
+        print(f"\n\n  FULL MODEL vs MARKET COMPARISON")
+        print_full_comparison(predictions, markets)
