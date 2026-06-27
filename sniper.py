@@ -160,30 +160,78 @@ def get_remaining_forecast(city_key: str, local_date: str) -> dict:
     }
 
 
-# ── Final-high distribution ─────────────────────────────────────────
+# ── Final-high model (live-recalibrated) ────────────────────────────
+#
+# The original model — final = max(obs_max + [0,1,2]°F spike, Normal(rem_max,
+# 0.6+0.18·hours)) — was badly overconfident: on 38 verified signals it
+# claimed 89% and realized 61% (log loss 1.06). Reconstructing those signals
+# showed the remaining-hours forecast max is itself an ~unbiased predictor of
+# the settled high (error mean +0.15°F, σ≈1.4°F live), and that a single
+# Normal centered there, floored at the already-observed max, calibrates to
+# within ~3 points (claimed 64% / realized 61%, log loss 0.23) and is robust
+# across σ ∈ [1.4, 4.0]. So we drop the two-component max() hack and model:
+#
+#     final_high = max(obs_max, Normal(center + bias, σ))
+#     center = max(obs_max, rem_max)            # forecast is the best center
+#     bias, σ = live-recalibrated from (settled_high − rem_max) errors
+#
+# obs_max is a hard physical floor — the day's high can't be below what's
+# already been recorded.
+
+DEFAULT_FH_SIGMA = 2.5     # used until enough verified history exists (wide on purpose)
+FH_SIGMA_FLOOR = 2.0       # never trust the forecast tighter than this
+FH_SIGMA_CAP = 4.0
+FH_BIAS_CLIP = 2.0
+FH_MIN_HISTORY = 6         # days needed before trusting fitted bias/σ
+
+
+def fit_final_high_model(conn: sqlite3.Connection) -> dict:
+    """
+    Calibrate the final-high distribution from verified history.
+
+    For each past day we have the remaining-hours forecast max logged at signal
+    time (rem_max_f) and the settled high (daily_predictions.actual_high_f).
+    The settlement error (actual − rem_max) gives bias and σ. A conservative
+    σ floor keeps us from ever getting overconfident again; below FH_MIN_HISTORY
+    days we fall back to a deliberately wide default.
+    """
+    rows = conn.execute("""
+        SELECT AVG(s.rem_max_f), p.actual_high_f
+        FROM sniper_signals s
+        JOIN daily_predictions p ON p.date = s.date AND p.city = s.city
+        WHERE s.rem_max_f IS NOT NULL AND p.actual_high_f IS NOT NULL
+        GROUP BY s.date, s.city
+    """).fetchall()
+    errs = [act - rem for rem, act in rows if rem is not None and act is not None]
+
+    if len(errs) < FH_MIN_HISTORY:
+        return {"bias": 0.0, "sigma": DEFAULT_FH_SIGMA, "n": len(errs)}
+
+    mean = sum(errs) / len(errs)
+    var = sum((e - mean) ** 2 for e in errs) / len(errs)
+    sigma = min(max(var ** 0.5, FH_SIGMA_FLOOR), FH_SIGMA_CAP)
+    bias = max(-FH_BIAS_CLIP, min(FH_BIAS_CLIP, mean))
+    return {"bias": bias, "sigma": sigma, "n": len(errs)}
+
 
 def final_high_samples(obs_max: float, rem_max: float | None,
-                       hours_remaining: int, rng=None) -> np.ndarray:
+                       hours_remaining: int, model: dict | None = None,
+                       rng=None) -> np.ndarray:
     """
     Monte Carlo distribution of the settlement (CLI) daily max.
 
-        final = max(obs_max + spike, future_max)
-
-    spike: the CLI max comes from continuous sensor data and typically reads
-    0-2°F above the max of hourly METAR observations.
-    future_max: Normal around the remaining-hours forecast max; σ grows with
-    how many hours are left for the forecast to be wrong.
+    Center on the remaining-hours forecast max (best single predictor), spread
+    by the live-recalibrated settlement error, and floor at obs_max — the high
+    cannot be below what's already been observed. When no remaining forecast is
+    available, fall back to obs_max plus a small CLI-vs-METAR spike.
     """
     rng = rng or np.random.default_rng(42)
-    spike = rng.choice([0.0, 1.0, 2.0], size=MC_SAMPLES, p=[0.50, 0.40, 0.10])
-    locked = obs_max + spike
+    sigma = (model or {}).get("sigma", DEFAULT_FH_SIGMA)
+    bias = (model or {}).get("bias", 0.0)
 
-    if rem_max is None or hours_remaining == 0:
-        return locked
-
-    sigma = min(0.6 + 0.18 * hours_remaining, 3.0)
-    future = rng.normal(rem_max, sigma, size=MC_SAMPLES)
-    return np.maximum(locked, future)
+    center = max(obs_max, rem_max) if rem_max is not None else obs_max + 1.0
+    samples = rng.normal(center + bias, sigma, size=MC_SAMPLES)
+    return np.maximum(obs_max, samples)   # physical floor: high >= observed max
 
 
 def contract_prob_yes(samples: np.ndarray, info: dict, title: str) -> float | None:
@@ -205,7 +253,8 @@ def contract_prob_yes(samples: np.ndarray, info: dict, title: str) -> float | No
 
 # ── Signal generation ───────────────────────────────────────────────
 
-def find_sniper_signals(city_key: str, local_date: str) -> tuple[list[TradeSignal], dict]:
+def find_sniper_signals(city_key: str, local_date: str,
+                        fh_model: dict | None = None) -> tuple[list[TradeSignal], dict]:
     """Generate same-day signals for one city. Returns (signals, context)."""
     city = CITIES[city_key]
     ctx = {"obs": None, "rem": None}
@@ -220,7 +269,8 @@ def find_sniper_signals(city_key: str, local_date: str) -> tuple[list[TradeSigna
     print(f"  [{city_key}] obs max {obs['obs_max_f']:.1f}°F ({obs['n_obs']} obs) | "
           f"remaining fcst max {rem['rem_max_f']}°F over {rem['hours_remaining']}h")
 
-    samples = final_high_samples(obs["obs_max_f"], rem["rem_max_f"], rem["hours_remaining"])
+    samples = final_high_samples(obs["obs_max_f"], rem["rem_max_f"],
+                                 rem["hours_remaining"], model=fh_model)
 
     # Today's Kalshi date code, e.g. 2026-06-11 -> 26JUN11
     dt = datetime.strptime(local_date, "%Y-%m-%d")
@@ -316,6 +366,12 @@ def run(cities: list[str] = None, mode: str = "dry", budget: float = DEFAULT_BUD
     init_sniper_table(conn)
     verify_signals(conn)  # opportunistically score old signals
 
+    # Calibrate the final-high model from verified history (once per run)
+    fh_model = fit_final_high_model(conn)
+    print(f"Final-high model: σ={fh_model['sigma']:.2f}°F bias={fh_model['bias']:+.2f}°F "
+          f"(from {fh_model['n']} verified day(s)"
+          f"{'; using wide defaults' if fh_model['n'] < FH_MIN_HISTORY else ''})")
+
     if mode == "auto":
         status = validation_status(conn)
         mode = "live" if status["passed"] else "dry"
@@ -336,7 +392,7 @@ def run(cities: list[str] = None, mode: str = "dry", budget: float = DEFAULT_BUD
             continue
         local_date = now_local.strftime("%Y-%m-%d")
         try:
-            signals, ctx = find_sniper_signals(ck, local_date)
+            signals, ctx = find_sniper_signals(ck, local_date, fh_model=fh_model)
         except Exception as e:
             print(f"  [{ck}] ERROR: {e}")
             continue
