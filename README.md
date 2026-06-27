@@ -11,6 +11,16 @@ covering winner's-curse diagnosis, proper-scoring-rule benchmarking against
 market prices, and the structural fixes that followed. The negative result and
 its analysis are the most interesting part of this project.
 
+![Reliability diagram and live P&L](assets/calibration.png)
+
+*The whole project in one chart (92 settled trades — the postmortem analyzed the
+first 89; the three that settled later left the conclusion unchanged). Left: the
+model's probabilities sit below the diagonal — overconfident — and score a worse
+Brier (0.22) than the market-implied price (0.13), a −0.74 skill score. Right:
+the resulting −$23 P&L. The point forecasts were good (live MAE 1.4°F); the edge
+died in the probability layer under adverse selection. Regenerate with
+`python make_figures.py`; the underlying trades are in [`data/live_trades.csv`](data/live_trades.csv).*
+
 ## Highlights
 
 - **Probabilistic forecasting & calibration.** Per-city Lasso/Ridge correction
