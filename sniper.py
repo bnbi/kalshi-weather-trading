@@ -69,6 +69,12 @@ MC_SAMPLES = 20000
 VALIDATION_MIN_SIGNALS = 15
 VALIDATION_MAX_CALIB_GAP = 0.15   # claimed prob may exceed realized win rate by ≤15pts
 
+# Probability-model version. Bump this whenever the final-high model changes so
+# the validation gate only counts signals scored by the CURRENT model. Signals
+# logged before this tag existed have model_version = NULL (the old, badly
+# overconfident max(obs+spike, forecast) model) and are excluded from the gate.
+MODEL_VERSION = "fh-rem-forecast-v2"
+
 
 # ── Database ────────────────────────────────────────────────────────
 
@@ -89,9 +95,14 @@ def init_sniper_table(conn: sqlite3.Connection) -> None:
             mode TEXT NOT NULL,            -- 'dry' or 'live'
             traded INTEGER DEFAULT 0,
             outcome TEXT,                  -- 'win'/'loss' once verified
-            hypo_profit REAL               -- profit of 1 contract at ask
+            hypo_profit REAL,              -- profit of 1 contract at ask
+            model_version TEXT             -- which prob model scored this signal
         );
     """)
+    # Migration: add model_version to pre-existing tables (NULL = legacy model)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(sniper_signals)")}
+    if "model_version" not in cols:
+        conn.execute("ALTER TABLE sniper_signals ADD COLUMN model_version TEXT")
     conn.commit()
 
 
@@ -338,21 +349,35 @@ def verify_signals(conn: sqlite3.Connection) -> int:
     return n
 
 
-def validation_status(conn: sqlite3.Connection) -> dict:
+def validation_status(conn: sqlite3.Connection,
+                      model_version: str = MODEL_VERSION) -> dict:
+    """
+    Validation metrics for the CURRENT probability model only. Signals scored by
+    older models (model_version != current, including legacy NULL rows) are
+    excluded so the gate reflects how the model trading today actually performs.
+    """
     row = conn.execute("""
         SELECT COUNT(*), AVG(CASE WHEN outcome='win' THEN 1.0 ELSE 0.0 END),
                AVG(prob), SUM(hypo_profit), SUM(ask_price)
-        FROM sniper_signals WHERE outcome IS NOT NULL
-    """).fetchone()
+        FROM sniper_signals
+        WHERE outcome IS NOT NULL AND model_version = ?
+    """, (model_version,)).fetchone()
     n, win_rate, avg_prob, profit, staked = row
     n = n or 0
+    # Count legacy verified signals (old model) for reporting context only
+    legacy = conn.execute("""
+        SELECT COUNT(*) FROM sniper_signals
+        WHERE outcome IS NOT NULL
+          AND (model_version IS NULL OR model_version != ?)
+    """, (model_version,)).fetchone()[0]
     passed = bool(
         n >= VALIDATION_MIN_SIGNALS
         and (profit or 0) > 0
         and (avg_prob or 1) - (win_rate or 0) <= VALIDATION_MAX_CALIB_GAP
     )
     return {"n_verified": n, "win_rate": win_rate, "avg_claimed_prob": avg_prob,
-            "hypo_profit": profit, "hypo_staked": staked, "passed": passed}
+            "hypo_profit": profit, "hypo_staked": staked, "passed": passed,
+            "n_legacy": legacy, "model_version": model_version}
 
 
 # ── Main run ────────────────────────────────────────────────────────
@@ -412,14 +437,14 @@ def run(cities: list[str] = None, mode: str = "dry", budget: float = DEFAULT_BUD
         conn.execute("""
             INSERT INTO sniper_signals
             (created_at, date, city, ticker, side, prob, ask_price,
-             obs_max_f, rem_max_f, hours_remaining, mode)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             obs_max_f, rem_max_f, hours_remaining, mode, model_version)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (now_iso, datetime.now(tz).strftime("%Y-%m-%d"), ck, s.ticker, s.side,
               s.model_prob, s.market_price,
               ctx["obs"]["obs_max_f"] if ctx["obs"] else None,
               ctx["rem"]["rem_max_f"] if ctx["rem"] else None,
               ctx["rem"]["hours_remaining"] if ctx["rem"] else None,
-              mode))
+              mode, MODEL_VERSION))
     conn.commit()
 
     print(f"\n  {len(all_signals)} signal(s) [{mode.upper()}]:")
@@ -491,16 +516,23 @@ def report():
         print(f"Verified {n} new signal(s).")
     s = validation_status(conn)
     print(f"\n  SNIPER VALIDATION STATUS")
-    print(f"  Verified signals:   {s['n_verified']} (need ≥{VALIDATION_MIN_SIGNALS})")
+    print(f"  Model version:      {s['model_version']}")
+    print(f"  Verified signals:   {s['n_verified']} (need ≥{VALIDATION_MIN_SIGNALS}, current model only)")
+    if s["n_legacy"]:
+        print(f"  Legacy signals:     {s['n_legacy']} excluded (scored by an older model)")
     if s["n_verified"]:
-        print(f"  Win rate:           {s['win_rate']:.0%} (claimed {s['avg_claimed_prob']:.0%})")
+        print(f"  Win rate:           {s['win_rate']:.0%} (claimed {s['avg_claimed_prob']:.0%}, "
+              f"gap {s['avg_claimed_prob'] - s['win_rate']:+.0%})")
         print(f"  Hypothetical P&L:   ${s['hypo_profit']:+.2f} on ${s['hypo_staked']:.2f} staked")
+    else:
+        print(f"  (no verified signals under the current model yet — keep running dry)")
     print(f"  LIVE TRADING GATE:  {'PASSED — --auto will trade live' if s['passed'] else 'not yet passed — --auto stays dry'}")
 
     print(f"\n  Recent signals:")
     for r in conn.execute("""SELECT date, city, ticker, side, ROUND(prob,2), ask_price,
-                                    mode, COALESCE(outcome,'?') FROM sniper_signals
-                             ORDER BY id DESC LIMIT 15"""):
+                                    mode, COALESCE(outcome,'?'),
+                                    COALESCE(model_version,'legacy')
+                             FROM sniper_signals ORDER BY id DESC LIMIT 15"""):
         print(f"    {r}")
     conn.close()
 
