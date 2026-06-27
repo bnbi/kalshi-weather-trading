@@ -1,20 +1,20 @@
 """
 Probability Model
-Converts NWS forecasts into calibrated probability estimates for Kalshi contracts.
+Converts weather forecasts into calibrated probability estimates for Kalshi contracts.
 
 The core idea:
-- NWS gives us a point forecast (e.g., "high of 82°F")
-- NWS forecasts have known error characteristics (roughly normal, ~3°F std dev for next-day)
-- We model the actual temperature as: actual = forecast + error
-  where error ~ Normal(bias, sigma)
-- This gives us a full probability distribution over possible high temps
+- We pull forecasts from multiple sources (NWS, GFS, ECMWF) via the ensemble module
+- The ensemble gives us a best-estimate high temp AND a measure of model disagreement
+- We model the actual temperature as: actual ~ Normal(ensemble_mean, ensemble_std)
 - From that distribution, we can compute P(temp > threshold) or P(temp in bracket)
+
+When the ensemble is unavailable, we fall back to NWS-only with default error estimates.
 """
 
-import math
 from dataclasses import dataclass
 from scipy import stats
 
+from weather_ensemble import build_ensemble
 from weather import (
     CITIES,
     get_daily_high_forecast,
@@ -106,7 +106,15 @@ def compute_probability(forecast_high: float, error_std: float, bias: float,
 
     For bracket contracts:
         - P(bracket_low <= actual <= bracket_high)
+
+    Probabilities are clamped to [0.03, 0.97] because:
+    - No weather forecast is ever 99%+ certain
+    - The market has information we don't (local observers, newer data)
+    - Overconfident probabilities create false "edge" that bleeds money
     """
+    PROB_FLOOR = 0.03
+    PROB_CEILING = 0.97
+
     # Our distribution of the actual high temperature
     dist = stats.norm(loc=forecast_high + bias, scale=error_std)
 
@@ -125,60 +133,82 @@ def compute_probability(forecast_high: float, error_std: float, bias: float,
             # Default to "above" for T contracts
             prob = 1 - dist.cdf(threshold)
 
-        return prob
+        return max(PROB_FLOOR, min(PROB_CEILING, prob))
 
     elif contract_info["type"] == "bracket":
         low = contract_info["bracket_low"]
         high = contract_info["bracket_high"]
-        # P(low <= temp <= high)
-        # Actually for integer temperatures, "82-83" means temp rounds to 82 or 83
-        # So the actual range is [low - 0.5, high + 0.5] for continuous temps
-        # But Kalshi uses the actual integer boundaries, so [low, high] inclusive
-        # For a continuous model, P(low <= X <= high) = CDF(high) - CDF(low)
-        prob = dist.cdf(high) - dist.cdf(low)
-        return prob
+        # Settlement is the integer (rounded) daily high. The bracket pays YES
+        # if that rounded high is any integer in [low, high]. A continuous temp
+        # rounds into that set when it falls in [low - 0.5, high + 0.5).
+        # Using cdf(high) - cdf(low) here understated the bracket width by 1°F;
+        # this matches the rounding logic used in sniper.py's verifier.
+        prob = dist.cdf(high + 0.5) - dist.cdf(low - 0.5)
+        # For brackets, floor is even lower since they're naturally low-probability
+        return max(0.01, min(PROB_CEILING, prob))
 
     return 0.5  # fallback for unknown contract types
 
 
-def predict_contract(ticker: str, title: str, city_key: str) -> ContractPrediction:
+def predict_contract(ticker: str, title: str, city_key: str,
+                     ensemble_cache: dict = None) -> ContractPrediction:
     """
     Generate a probability prediction for a single contract.
 
     ticker: Kalshi market ticker (e.g. 'KXHIGHCHI-26MAY05-T65')
     title: Market title (needed to determine above/below for threshold contracts)
     city_key: Key into CITIES dict ('chicago', 'nyc', 'miami')
+    ensemble_cache: optional {date: EnsembleForecast} to avoid re-fetching
     """
     contract_info = parse_contract_ticker(ticker)
     city = CITIES[city_key]
-
-    # Get forecast for the contract's date
     target_date = contract_info.get("date")
-    forecast = get_daily_high_forecast(city, target_date)
 
-    forecast_high = forecast["forecast_high_f"]
-    if forecast_high is None:
-        raise ValueError(f"No forecast available for {city.name} on {target_date}")
+    # Try ensemble forecast first (multiple models combined)
+    ensemble = None
+    if ensemble_cache and target_date in ensemble_cache:
+        ensemble = ensemble_cache[target_date]
+    else:
+        try:
+            ensemble = build_ensemble(city_key, target_date)
+            if ensemble_cache is not None:
+                ensemble_cache[target_date] = ensemble
+        except Exception as e:
+            print(f"  Warning: ensemble failed, falling back to NWS-only: {e}")
 
+    if ensemble and ensemble.ensemble_high_f is not None:
+        # Use ensemble forecast
+        forecast_high = ensemble.ensemble_high_f
+        error_std = ensemble.ensemble_std
+        bias = 0.0  # ensemble already accounts for model biases
+    else:
+        # Fall back to NWS-only
+        forecast = get_daily_high_forecast(city, target_date)
+        forecast_high = forecast["forecast_high_f"]
+        if forecast_high is None:
+            raise ValueError(f"No forecast available for {city.name} on {target_date}")
+
+        lead_days = get_forecast_lead_days(target_date)
+        error_std = get_forecast_error_std(lead_days)
+        bias = NWS_FORECAST_BIAS.get(city_key, 0.0)
+
+    # For same-day contracts, also check if peak has passed
     lead_days = get_forecast_lead_days(target_date)
-    error_std = get_forecast_error_std(lead_days)
-    bias = NWS_FORECAST_BIAS.get(city_key, 0.0)
-
-    # Adjust uncertainty based on how confident we are the peak has passed.
-    # Even when temps are declining, there can be secondary peaks, measurement
-    # station differences, or late-day warming events.
-    peak_confidence = forecast.get("peak_confidence", "low")
     if lead_days <= 0:
-        if peak_confidence == "high":
-            # Very confident peak is done — temps far below max, day nearly over
-            error_std = 1.0
-            bias = 0.0
-        elif peak_confidence == "medium":
-            # Probably past the peak, but some chance of a secondary rise
-            error_std = 1.5
-            bias = 0.0
-        # "low" confidence: keep the default same-day σ (2.0°F)
-        # This means future temps are still close to the max — uncertain
+        try:
+            nws_forecast = get_daily_high_forecast(city, target_date)
+            peak_confidence = nws_forecast.get("peak_confidence", "low")
+            if peak_confidence == "high":
+                # Peak is done — use observed max with tight uncertainty
+                forecast_high = nws_forecast["forecast_high_f"]
+                error_std = 1.0
+                bias = 0.0
+            elif peak_confidence == "medium":
+                forecast_high = nws_forecast["forecast_high_f"]
+                error_std = 1.5
+                bias = 0.0
+        except Exception:
+            pass
 
     prob = compute_probability(forecast_high, error_std, bias, contract_info, title)
 
@@ -211,6 +241,7 @@ def predict_all_for_city(city_key: str, markets: list[dict]) -> list[ContractPre
     """
     predictions = []
     city = CITIES[city_key]
+    ensemble_cache = {}  # {date: EnsembleForecast} — avoids re-fetching per contract
 
     for m in markets:
         ticker = m.get("ticker", "")
@@ -221,7 +252,7 @@ def predict_all_for_city(city_key: str, markets: list[dict]) -> list[ContractPre
             continue
 
         try:
-            pred = predict_contract(ticker, title, city_key)
+            pred = predict_contract(ticker, title, city_key, ensemble_cache)
             predictions.append(pred)
         except Exception as e:
             print(f"  Warning: could not predict {ticker}: {e}")
@@ -229,7 +260,7 @@ def predict_all_for_city(city_key: str, markets: list[dict]) -> list[ContractPre
     return predictions
 
 
-def print_predictions(predictions: list[ContractPrediction]):
+def print_predictions(predictions: list[ContractPrediction]) -> None:
     """Pretty-print model predictions."""
     print(f"\n{'Ticker':<45} {'Description':<30} {'Model P':<10} {'Forecast'}")
     print("-" * 100)

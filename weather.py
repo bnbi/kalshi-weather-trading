@@ -10,7 +10,6 @@ than what retail bettors use.
 """
 
 import requests
-import statistics
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Optional
@@ -24,6 +23,7 @@ class City:
     kalshi_series: str
     lat: float
     lon: float
+    timezone: str = "America/Chicago"
     nws_grid_url: Optional[str] = None  # cached after first lookup
 
 
@@ -31,20 +31,26 @@ CITIES = {
     "chicago": City(
         name="Chicago",
         kalshi_series="KXHIGHCHI",
-        lat=41.8781,
-        lon=-87.6298,
+        # Kalshi settles on NWS reading at Chicago Midway Airport (KMDW)
+        lat=41.7868,
+        lon=-87.7522,
+        timezone="America/Chicago",
     ),
     "nyc": City(
         name="New York City",
         kalshi_series="KXHIGHNY",
-        lat=40.7128,
-        lon=-74.0060,
+        # Kalshi settles on NWS reading at Central Park (KNYC)
+        lat=40.7789,
+        lon=-73.9692,
+        timezone="America/New_York",
     ),
     "miami": City(
         name="Miami",
         kalshi_series="KXHIGHMIA",
-        lat=25.7617,
-        lon=-80.1918,
+        # Kalshi settles on NWS reading at Miami Intl Airport (KMIA)
+        lat=25.7959,
+        lon=-80.2870,
+        timezone="America/New_York",
     ),
 }
 
@@ -66,6 +72,7 @@ def get_grid_urls(city: City) -> dict:
     resp = requests.get(
         f"{NWS_BASE}/points/{city.lat},{city.lon}",
         headers=NWS_HEADERS,
+        timeout=15,
     )
     resp.raise_for_status()
     props = resp.json()["properties"]
@@ -86,7 +93,7 @@ def get_hourly_forecast(city: City) -> list[dict]:
     Returns list of {time, temperature, unit} dicts.
     """
     grid = get_grid_urls(city)
-    resp = requests.get(grid["forecast_hourly"], headers=NWS_HEADERS)
+    resp = requests.get(grid["forecast_hourly"], headers=NWS_HEADERS, timeout=15)
     resp.raise_for_status()
 
     periods = resp.json()["properties"]["periods"]
@@ -108,7 +115,7 @@ def get_gridpoint_data(city: City) -> dict:
     This is more detailed than the public forecast.
     """
     grid = get_grid_urls(city)
-    resp = requests.get(grid["forecast_grid_data"], headers=NWS_HEADERS)
+    resp = requests.get(grid["forecast_grid_data"], headers=NWS_HEADERS, timeout=15)
     resp.raise_for_status()
     return resp.json()["properties"]
 
@@ -268,7 +275,7 @@ def get_forecast_error_std(lead_days: int) -> float:
 
 # ── Convenience functions ───────────────────────────────────────────
 
-def print_forecast_summary(city_key: str, target_date: str = None):
+def print_forecast_summary(city_key: str, target_date: str = None) -> None:
     """Print a quick forecast summary for a city."""
     city = CITIES[city_key]
     forecast = get_daily_high_forecast(city, target_date)

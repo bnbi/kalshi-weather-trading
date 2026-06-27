@@ -3,6 +3,11 @@ config.py
 __pycache__/
 *.pyc
 *.db
+*.db-wal
+*.db-shm
+*.db-journal
+.DS_Store
+.fuse_hidden*
 .env
 venv/
 .venv/

@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Job identifier -->
+    <key>Label</key>
+    <string>com.kalshi.weatherbot</string>
+
+    <!-- What to run -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/brianbi/kalshi-bot/venv/bin/python</string>
+        <string>/Users/brianbi/kalshi-bot/scheduler.py</string>
+        <string>run</string>
+        <string>--max-spend</string>
+        <string>10</string>
+    </array>
+
+    <!-- Working directory -->
+    <key>WorkingDirectory</key>
+    <string>/Users/brianbi/kalshi-bot</string>
+
+    <!-- Run daily at 7:00 AM local time -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>10</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <!-- Stdout/stderr logging -->
+    <key>StandardOutPath</key>
+    <string>/Users/brianbi/kalshi-bot/logs/launchd_stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/brianbi/kalshi-bot/logs/launchd_stderr.log</string>
+
+    <!-- Environment variables (ensure Python can find modules) -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/brianbi/kalshi-bot/venv/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>PYTHONPATH</key>
+        <string>/Users/brianbi/kalshi-bot</string>
+    </dict>
+
+    <!-- Don't restart if it crashes — we only want one run per day -->
+    <key>KeepAlive</key>
+    <false/>
+
+    <!-- Process niceness (don't hog CPU) -->
+    <key>Nice</key>
+    <integer>10</integer>
+</dict>
+</plist>

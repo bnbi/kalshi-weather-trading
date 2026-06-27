@@ -4,6 +4,8 @@ Pulls market snapshots from Kalshi and stores them in a local SQLite database.
 Run this periodically (e.g. every hour via cron) to build a historical dataset.
 """
 
+from __future__ import annotations
+
 import sqlite3
 import json
 import time
@@ -79,7 +81,7 @@ def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
 # ── Data collection ─────────────────────────────────────────────────
 
 def collect_markets(client: KalshiClient, conn: sqlite3.Connection,
-                    series_ticker: str = None, event_ticker: str = None):
+                    series_ticker: str = None, event_ticker: str = None) -> int:
     """Fetch all open markets and upsert into the database."""
     now = datetime.now(timezone.utc).isoformat()
     cursor = None
@@ -137,7 +139,7 @@ def collect_markets(client: KalshiClient, conn: sqlite3.Connection,
 
 
 def collect_snapshots(client: KalshiClient, conn: sqlite3.Connection,
-                      tickers: list[str] = None):
+                      tickers: list[str] = None) -> int:
     """
     Take price/volume snapshots for specified markets.
     If tickers is None, snapshot all open markets in the database.
@@ -187,7 +189,7 @@ def collect_snapshots(client: KalshiClient, conn: sqlite3.Connection,
 
 
 def collect_orderbooks(client: KalshiClient, conn: sqlite3.Connection,
-                       tickers: list[str]):
+                       tickers: list[str]) -> int:
     """Take order book snapshots for specific markets."""
     now = datetime.now(timezone.utc).isoformat()
     count = 0

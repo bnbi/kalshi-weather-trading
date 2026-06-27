@@ -5,8 +5,9 @@ Handles authentication (RSA-PSS) and core API calls.
 
 import time
 import base64
+from urllib.parse import urlparse
+
 import requests
-from datetime import datetime
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
@@ -58,7 +59,14 @@ class KalshiClient:
                  json_body: dict = None, auth: bool = False) -> dict:
         """Make an API request, optionally with authentication."""
         url = f"{self.base_url}{path}"
-        headers = self._sign_request(method, path) if auth else {}
+
+        # Sign the FULL path (e.g. /trade-api/v2/portfolio/balance)
+        # not just the relative path (/portfolio/balance)
+        if auth:
+            full_path = urlparse(url).path
+            headers = self._sign_request(method, full_path)
+        else:
+            headers = {}
 
         response = self.session.request(
             method=method,
@@ -66,6 +74,7 @@ class KalshiClient:
             headers=headers,
             params=params,
             json=json_body,
+            timeout=15,
         )
         response.raise_for_status()
         return response.json()
@@ -182,7 +191,7 @@ class KalshiClient:
         return self._request("GET", "/portfolio/orders", params=params, auth=True)
 
 
-def create_client_from_config():
+def create_client_from_config() -> KalshiClient:
     """Create a KalshiClient using settings from config.py."""
     try:
         import config

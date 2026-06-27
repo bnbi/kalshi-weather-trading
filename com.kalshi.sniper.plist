@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.kalshi.sniper</string>
+
+    <!-- Run the same-day sniper in --auto mode: it trades live only after
+         its validation gate passes (>=15 verified signals, positive hypothetical
+         P&L, honest calibration). Until then every run is a logged dry run. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/brianbi/kalshi-bot/venv/bin/python</string>
+        <string>/Users/brianbi/kalshi-bot/sniper.py</string>
+        <string>run</string>
+        <string>--auto</string>
+        <string>--budget</string>
+        <string>6</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/brianbi/kalshi-bot</string>
+
+    <!-- Hourly through the afternoon (local time). The sniper itself skips
+         any city whose local time is outside 13:00-21:00. -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Hour</key><integer>12</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>13</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>14</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>15</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>16</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>17</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>18</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>19</integer><key>Minute</key><integer>20</integer></dict>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>/Users/brianbi/kalshi-bot/logs/sniper_stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/brianbi/kalshi-bot/logs/sniper_stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/brianbi/kalshi-bot/venv/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>PYTHONPATH</key>
+        <string>/Users/brianbi/kalshi-bot</string>
+    </dict>
+
+    <key>KeepAlive</key>
+    <false/>
+    <key>Nice</key>
+    <integer>10</integer>
+</dict>
+</plist>

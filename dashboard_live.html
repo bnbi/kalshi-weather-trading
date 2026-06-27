@@ -1,0 +1,792 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kalshi Weather Bot — Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+:root {
+    --bg: #f0f2f5;
+    --card: #ffffff;
+    --border: #e2e5ea;
+    --text: #1a1d23;
+    --text-secondary: #6b7280;
+    --text-muted: #9ca3af;
+    --accent: #3b82f6;
+    --accent-light: #eff6ff;
+    --green: #10b981;
+    --green-light: #ecfdf5;
+    --green-dark: #059669;
+    --red: #ef4444;
+    --red-light: #fef2f2;
+    --amber: #f59e0b;
+    --amber-light: #fffbeb;
+    --navy: #0f172a;
+    --navy-light: #1e293b;
+    --radius: 12px;
+    --shadow-sm: 0 1px 2px rgba(0,0,0,0.04);
+    --shadow: 0 1px 3px rgba(0,0,0,0.06), 0 1px 2px rgba(0,0,0,0.04);
+}
+body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; background: var(--bg); color: var(--text); -webkit-font-smoothing: antialiased; }
+
+/* ── Header ─────────────────────────────────────────── */
+.header {
+    background: linear-gradient(135deg, var(--navy) 0%, var(--navy-light) 100%);
+    padding: 0 24px;
+    display: flex; align-items: center; height: 52px;
+    position: sticky; top: 0; z-index: 100;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+}
+.header-brand {
+    display: flex; align-items: center; gap: 9px;
+    font-size: 14px; font-weight: 600; color: #fff;
+}
+.header-brand svg { opacity: 0.9; }
+.header-tabs { display: flex; gap: 0; height: 100%; margin-left: 28px; }
+.header-tab {
+    padding: 0 16px; height: 100%; display: flex; align-items: center;
+    font-size: 13px; font-weight: 500; color: rgba(255,255,255,0.5);
+    cursor: pointer; border-bottom: 2px solid transparent; transition: all 0.2s;
+}
+.header-tab:hover { color: rgba(255,255,255,0.85); }
+.header-tab.active { color: #fff; border-bottom-color: var(--accent); }
+
+.header-right { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+.header-btn {
+    padding: 5px 12px; border-radius: 6px; font-size: 11px; font-weight: 600;
+    cursor: pointer; border: none; display: inline-flex; align-items: center; gap: 5px;
+    transition: all 0.15s;
+}
+.header-btn:active { transform: scale(0.96); }
+.header-btn.settle { background: rgba(59,130,246,0.2); color: #93c5fd; }
+.header-btn.settle:hover { background: rgba(59,130,246,0.3); }
+.header-btn.run { background: rgba(16,185,129,0.2); color: #6ee7b7; }
+.header-btn.run:hover { background: rgba(16,185,129,0.3); }
+.header-btn.kill { background: rgba(239,68,68,0.2); color: #fca5a5; }
+.header-btn.kill:hover { background: rgba(239,68,68,0.3); }
+.header-btn.resume { background: rgba(16,185,129,0.2); color: #6ee7b7; }
+.header-btn.resume:hover { background: rgba(16,185,129,0.3); }
+
+.status-pill {
+    display: flex; align-items: center; gap: 6px;
+    padding: 4px 10px 4px 8px; border-radius: 20px;
+    font-size: 11px; font-weight: 600;
+}
+.status-pill.active { background: rgba(16,185,129,0.15); color: #6ee7b7; }
+.status-pill.killed { background: rgba(239,68,68,0.15); color: #fca5a5; }
+.status-dot { width: 6px; height: 6px; border-radius: 50%; }
+.status-dot.active { background: #10b981; animation: blink 2s ease-in-out infinite; }
+.status-dot.killed { background: #ef4444; }
+@keyframes blink { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+/* ── Layout ────────────────────────────────────────── */
+.container { max-width: 1140px; margin: 0 auto; padding: 20px; }
+.page { display: none; }
+.page.visible { display: block; animation: fadeIn 0.15s ease; }
+@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+
+/* ── Metric cards ──────────────────────────────────── */
+.metrics-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); gap: 10px; margin-bottom: 20px; }
+.metric-card {
+    background: var(--card); border-radius: 10px; padding: 14px 16px;
+    border: 1px solid var(--border);
+}
+.metric-label { font-size: 10px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; }
+.metric-value { font-size: 20px; font-weight: 700; margin-top: 3px; letter-spacing: -0.02em; }
+.metric-sub { font-size: 10px; color: var(--text-muted); margin-top: 2px; }
+.text-green { color: var(--green); }
+.text-red { color: var(--red); }
+
+/* ── Cards ─────────────────────────────────────────── */
+.card {
+    background: var(--card); border-radius: 10px;
+    border: 1px solid var(--border); padding: 18px 20px;
+    margin-bottom: 16px;
+}
+.card-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+.card-title { font-size: 14px; font-weight: 600; }
+.card-subtitle { font-size: 11px; color: var(--text-muted); }
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 800px) { .grid-2 { grid-template-columns: 1fr; } }
+
+/* ── Table ─────────────────────────────────────────── */
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th {
+    text-align: left; padding: 7px 10px; font-size: 10px;
+    font-weight: 600; color: var(--text-muted); text-transform: uppercase;
+    letter-spacing: 0.04em; border-bottom: 2px solid var(--border);
+}
+td { padding: 8px 10px; border-bottom: 1px solid #f3f4f6; }
+tbody tr:hover { background: #f8f9fb; }
+
+/* ── Day group header in trades ────────────────────── */
+.day-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 12px; margin-top: 12px;
+    background: #f8f9fb; border-radius: 8px; border: 1px solid var(--border);
+}
+.day-header:first-child { margin-top: 0; }
+.day-date { font-size: 13px; font-weight: 600; }
+.day-stats { display: flex; gap: 14px; font-size: 11px; font-weight: 500; color: var(--text-secondary); }
+.day-stat-val { font-weight: 700; }
+
+/* ── Trade row (card style) ────────────────────────── */
+.trade-list { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; margin-bottom: 8px; }
+.trade-row {
+    display: grid; grid-template-columns: 1fr auto auto auto auto;
+    align-items: center; gap: 10px; padding: 8px 12px;
+    font-size: 12px; border-radius: 6px; transition: background 0.1s;
+}
+.trade-row:hover { background: #f8f9fb; }
+.trade-ticker { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 11px; color: var(--text-secondary); }
+.trade-city { font-size: 11px; color: var(--text-muted); margin-top: 1px; }
+
+/* ── Badges ────────────────────────────────────────── */
+.badge {
+    display: inline-flex; align-items: center; padding: 3px 8px; border-radius: 5px;
+    font-size: 11px; font-weight: 600;
+}
+.badge-yes { background: #dbeafe; color: #1d4ed8; }
+.badge-no { background: var(--amber-light); color: #b45309; }
+.badge-win { background: var(--green-light); color: #065f46; }
+.badge-loss { background: var(--red-light); color: #991b1b; }
+.badge-pending { background: #f3f4f6; color: #9ca3af; }
+.edge-pos { color: var(--green-dark); font-weight: 600; }
+.edge-neg { color: var(--text-muted); }
+
+/* ── Buttons ───────────────────────────────────────── */
+.btn {
+    padding: 7px 16px; border-radius: 7px; font-size: 12px; font-weight: 600;
+    cursor: pointer; border: 1px solid var(--border); background: var(--card);
+    color: var(--text); transition: all 0.15s; display: inline-flex; align-items: center; gap: 5px;
+}
+.btn:hover { background: #f5f6f8; }
+.btn:active { transform: scale(0.97); }
+.btn-success { background: var(--green); color: #fff; border-color: var(--green); }
+.btn-success:hover { background: var(--green-dark); }
+.btn-danger { background: var(--red); color: #fff; border-color: var(--red); }
+.btn-danger:hover { background: #dc2626; }
+.btn-sm { padding: 5px 11px; font-size: 11px; border-radius: 5px; }
+.btn-group { display: flex; gap: 8px; flex-wrap: wrap; }
+
+/* ── Controls page ─────────────────────────────────── */
+.controls-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+@media (max-width: 800px) { .controls-grid { grid-template-columns: 1fr; } }
+.kill-box {
+    display: flex; flex-direction: column; align-items: center;
+    justify-content: center; padding: 32px 20px; border-radius: 12px;
+    border: 2px solid; text-align: center;
+}
+.kill-box.safe { border-color: var(--green); background: linear-gradient(135deg, #ecfdf5, #d1fae5); }
+.kill-box.danger { border-color: var(--red); background: linear-gradient(135deg, #fef2f2, #fecaca); }
+.kill-status { font-size: 16px; font-weight: 700; margin-bottom: 4px; }
+.kill-sub { font-size: 12px; color: var(--text-secondary); margin-bottom: 14px; }
+
+.run-panel { display: flex; flex-direction: column; gap: 12px; }
+.run-info { font-size: 12px; color: var(--text-secondary); line-height: 1.5; }
+.budget-info {
+    background: #f8f9fb; border-radius: 7px; padding: 10px 14px;
+    font-size: 11px; color: var(--text-secondary); line-height: 1.6; border: 1px solid var(--border);
+}
+.budget-info strong { color: var(--text); }
+.next-run-badge {
+    display: inline-flex; align-items: center; gap: 5px;
+    background: var(--accent-light); color: var(--accent);
+    padding: 5px 10px; border-radius: 6px; font-size: 11px; font-weight: 600;
+}
+
+/* ── Log viewer ────────────────────────────────────── */
+.log-viewer {
+    background: var(--navy); color: #94a3b8; font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+    font-size: 11px; line-height: 1.7; padding: 16px; border-radius: 8px;
+    max-height: 300px; overflow-y: auto; white-space: pre-wrap; word-break: break-all;
+}
+
+/* ── Chart ──────────────────────────────────────────── */
+.chart-container { position: relative; height: 260px; margin: 6px 0; }
+.chart-sm { height: 200px; }
+
+/* ── Coefficient bars ──────────────────────────────── */
+.coef-section { margin-bottom: 16px; }
+.coef-city-label { font-size: 12px; font-weight: 600; margin-bottom: 8px; display: flex; align-items: center; gap: 6px; }
+.coef-city-label .model-badge { font-size: 9px; font-weight: 600; background: var(--accent-light); color: var(--accent); padding: 2px 7px; border-radius: 3px; text-transform: uppercase; letter-spacing: 0.04em; }
+.coef-row { display: flex; align-items: center; gap: 6px; margin: 3px 0; }
+.coef-label { font-size: 11px; width: 130px; text-align: right; color: var(--text-secondary); flex-shrink: 0; }
+.coef-track { flex: 1; height: 16px; background: #f3f4f6; border-radius: 3px; position: relative; overflow: hidden; }
+.coef-bar { height: 100%; border-radius: 3px; position: absolute; top: 0; transition: width 0.4s ease; }
+.coef-bar.pos { background: linear-gradient(90deg, #93c5fd, #3b82f6); left: 50%; }
+.coef-bar.neg { background: linear-gradient(270deg, #fca5a5, #ef4444); right: 50%; }
+.coef-val { font-size: 10px; width: 60px; color: var(--text-muted); font-family: 'SF Mono', monospace; }
+
+/* ── City filter pills ─────────────────────────────── */
+.filter-pills { display: flex; gap: 5px; margin-bottom: 14px; }
+.pill {
+    padding: 4px 14px; border-radius: 16px; font-size: 11px; font-weight: 500;
+    cursor: pointer; border: 1px solid var(--border); background: var(--card);
+    color: var(--text-secondary); transition: all 0.15s;
+}
+.pill:hover { border-color: var(--accent); color: var(--accent); }
+.pill.active { background: var(--navy); color: #fff; border-color: var(--navy); }
+
+/* ── Toast ──────────────────────────────────────────── */
+.toast {
+    position: fixed; bottom: 20px; right: 20px;
+    background: var(--navy); color: #fff; padding: 10px 20px;
+    border-radius: 8px; font-size: 12px; font-weight: 500;
+    z-index: 300; opacity: 0; transform: translateY(6px);
+    transition: all 0.3s; pointer-events: none;
+    box-shadow: 0 6px 20px rgba(0,0,0,0.2);
+}
+.toast.show { opacity: 1; transform: translateY(0); }
+
+/* ── Empty / loading ───────────────────────────────── */
+.loading { text-align: center; padding: 40px 20px; color: var(--text-muted); font-size: 13px; }
+.loading::before { content: ''; display: block; width: 22px; height: 22px; margin: 0 auto 10px; border: 2.5px solid #e5e7eb; border-top-color: var(--accent); border-radius: 50%; animation: spin 0.7s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.empty { text-align: center; padding: 30px 20px; color: var(--text-muted); font-size: 12px; }
+
+/* ── Scrollbar ──────────────────────────────────────── */
+.log-viewer::-webkit-scrollbar { width: 5px; }
+.log-viewer::-webkit-scrollbar-thumb { background: #475569; border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<!-- Header with quick actions -->
+<div class="header">
+    <div class="header-brand">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/></svg>
+        Weather Bot
+    </div>
+    <div class="header-tabs">
+        <div class="header-tab active" data-page="overview">Overview</div>
+        <div class="header-tab" data-page="trades">Trades</div>
+        <div class="header-tab" data-page="predictions">Predictions</div>
+        <div class="header-tab" data-page="controls">Controls</div>
+        <div class="header-tab" data-page="model">Model</div>
+    </div>
+    <div class="header-right">
+        <button class="header-btn settle" onclick="checkSettlements()" id="settle-btn" title="Check for settled markets">Settle</button>
+        <button class="header-btn run" onclick="triggerRun(false)" title="Run live trading now">Run</button>
+        <button class="header-btn kill" id="kill-header-btn" onclick="toggleKill()" title="Toggle kill switch">Kill</button>
+        <div class="status-pill active" id="status-pill">
+            <div class="status-dot active" id="status-dot"></div>
+            <span id="status-label">Active</span>
+        </div>
+    </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<!-- ═══════════ OVERVIEW ═══════════ -->
+<div class="container page visible" id="page-overview">
+    <div class="metrics-row" id="metrics"></div>
+    <div class="grid-2">
+        <div class="card">
+            <div class="card-header">
+                <span class="card-title">Cumulative P&L</span>
+                <span class="card-subtitle" id="pnl-updated"></span>
+            </div>
+            <div class="chart-container"><canvas id="pnl-chart"></canvas></div>
+        </div>
+        <div class="card">
+            <div class="card-header"><span class="card-title">Open Positions</span></div>
+            <div id="positions-body"><div class="loading">Loading...</div></div>
+        </div>
+    </div>
+</div>
+
+<!-- ═══════════ TRADES (grouped by day) ═══════════ -->
+<div class="container page" id="page-trades">
+    <div class="card">
+        <div class="card-header">
+            <span class="card-title">Trade History</span>
+            <button class="btn btn-sm" onclick="checkSettlements()">Check Settlements</button>
+        </div>
+        <div id="trades-by-day"><div class="loading">Loading...</div></div>
+    </div>
+</div>
+
+<!-- ═══════════ PREDICTIONS ═══════════ -->
+<div class="container page" id="page-predictions">
+    <div class="card">
+        <div class="card-header">
+            <span class="card-title">Model vs. Market</span>
+            <span class="card-subtitle">Where the model sees edge</span>
+        </div>
+        <div class="filter-pills" id="city-filter"></div>
+        <div class="table-wrap" id="predictions-body"><div class="loading">Loading...</div></div>
+    </div>
+</div>
+
+<!-- ═══════════ CONTROLS ═══════════ -->
+<div class="container page" id="page-controls">
+    <div class="controls-grid">
+        <div class="card">
+            <div class="card-title" style="margin-bottom:14px">Kill Switch</div>
+            <div class="kill-box safe" id="kill-box">
+                <div class="kill-status" id="kill-status">Trading Active</div>
+                <div class="kill-sub" id="kill-sub">The bot is live and placing orders normally</div>
+                <button class="btn btn-danger" id="kill-btn" onclick="toggleKill()">Engage Kill Switch</button>
+            </div>
+        </div>
+        <div class="card">
+            <div class="card-title" style="margin-bottom:14px">Run Trading</div>
+            <div class="run-panel">
+                <div class="run-info">Trigger a manual trading run.</div>
+                <div class="btn-group">
+                    <button class="btn" onclick="triggerRun(true)">Dry Run</button>
+                    <button class="btn btn-success" onclick="triggerRun(false)">Live Run</button>
+                </div>
+                <div class="budget-info">
+                    <strong>Budget:</strong> $10 total across 3 cities (~$3.33 each), capped to balance
+                </div>
+                <div class="next-run-badge" id="next-run">
+                    <span id="next-run-text">Next run: —</span>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="card">
+        <div class="card-header">
+            <span class="card-title">Logs</span>
+            <button class="btn btn-sm" onclick="loadStatus()">Refresh</button>
+        </div>
+        <div class="log-viewer" id="log-viewer">Waiting for logs...</div>
+    </div>
+</div>
+
+<!-- ═══════════ MODEL HEALTH ═══════════ -->
+<div class="container page" id="page-model">
+    <div class="metrics-row" id="model-metrics"></div>
+    <div class="grid-2">
+        <div class="card">
+            <div class="card-header"><span class="card-title">Calibration Curve</span></div>
+            <div class="chart-container chart-sm"><canvas id="cal-chart"></canvas></div>
+            <p style="font-size:11px;color:var(--text-muted);margin-top:6px" id="brier-score"></p>
+        </div>
+        <div class="card">
+            <div class="card-header"><span class="card-title">Feature Weights</span></div>
+            <div id="coef-body"><div class="loading">Loading...</div></div>
+        </div>
+    </div>
+    <div class="card">
+        <div class="card-header">
+            <span class="card-title">Forecast Error Tracking</span>
+            <span class="card-subtitle">Model vs raw forecasts</span>
+        </div>
+        <div class="filter-pills" id="mae-city-filter"></div>
+        <div class="chart-container"><canvas id="mae-chart"></canvas></div>
+    </div>
+</div>
+
+<script>
+// ── State ──────────────────────────────────────────
+let currentPage = 'overview';
+let pnlChart = null, calChart = null, maeChart = null;
+let predictionsData = [], modelHealthData = null, allTrades = [];
+let selectedCity = 'all', selectedMaeCity = 'chicago';
+
+// ── Navigation ─────────────────────────────────────
+document.querySelectorAll('.header-tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+        document.querySelectorAll('.header-tab').forEach(t => t.classList.remove('active'));
+        tab.classList.add('active');
+        const page = tab.dataset.page;
+        document.querySelectorAll('.page').forEach(p => p.classList.remove('visible'));
+        document.getElementById('page-' + page).classList.add('visible');
+        currentPage = page;
+    });
+});
+
+// ── Toast ──────────────────────────────────────────
+function toast(msg) {
+    const el = document.getElementById('toast');
+    el.textContent = msg;
+    el.classList.add('show');
+    setTimeout(() => el.classList.remove('show'), 3500);
+}
+
+// ── Formatters ─────────────────────────────────────
+const fmt = (n, d=2) => n != null ? Number(n).toFixed(d) : '—';
+const fmtPct = n => n != null ? (n * 100).toFixed(1) + '%' : '—';
+const fmtDollars = n => n != null ? '$' + Number(n).toFixed(2) : '—';
+
+function cityFromTicker(ticker) {
+    if (ticker.includes('CHI')) return 'Chicago';
+    if (ticker.includes('NY')) return 'NYC';
+    if (ticker.includes('MIA')) return 'Miami';
+    return '';
+}
+
+// ── API helper ─────────────────────────────────────
+async function api(path, opts) {
+    try { return await (await fetch(path, opts)).json(); }
+    catch (e) { console.error('API error:', path, e); return null; }
+}
+
+// ── OVERVIEW PAGE ──────────────────────────────────
+async function loadOverview() {
+    const [summary, daily, positions, trades, balance] = await Promise.all([
+        api('/api/summary'), api('/api/daily_pnl'), api('/api/positions'),
+        api('/api/trades'), api('/api/balance'),
+    ]);
+    allTrades = trades || [];
+
+    const s = summary || {};
+    const bal = (balance && !balance.error) ? (balance.balance / 100) : null;
+
+    const items = [
+        { label: 'Balance', value: bal != null ? fmtDollars(bal) : '—', cls: '' },
+        { label: 'Total P&L', value: s.total_pnl != null ? fmtDollars(s.total_pnl) : '—', cls: s.total_pnl > 0 ? 'text-green' : s.total_pnl < 0 ? 'text-red' : '' },
+        { label: 'Win Rate', value: s.win_rate != null ? fmtPct(s.win_rate) : '—', cls: '' },
+        { label: 'ROI', value: s.roi != null ? fmt(s.roi, 1) + '%' : '—', cls: s.roi > 0 ? 'text-green' : s.roi < 0 ? 'text-red' : '' },
+        { label: 'Trades', value: s.total_trades || 0, sub: (s.pending_trades || 0) + ' pending' },
+        { label: 'Streak', value: s.streak != null ? (s.streak > 0 ? s.streak + 'W' : s.streak < 0 ? Math.abs(s.streak) + 'L' : '—') : '—', cls: s.streak > 0 ? 'text-green' : s.streak < 0 ? 'text-red' : '' },
+    ];
+    document.getElementById('metrics').innerHTML = items.map(m =>
+        `<div class="metric-card"><div class="metric-label">${m.label}</div><div class="metric-value ${m.cls||''}">${m.value}</div>${m.sub ? `<div class="metric-sub">${m.sub}</div>` : ''}</div>`
+    ).join('');
+
+    // P&L chart
+    const pnlCtx = document.getElementById('pnl-chart');
+    if (pnlChart) pnlChart.destroy();
+    if (daily && daily.length > 0) {
+        pnlChart = new Chart(pnlCtx, {
+            type: 'line',
+            data: {
+                labels: daily.map(d => d.date),
+                datasets: [{
+                    label: 'Cumulative P&L',
+                    data: daily.map(d => d.cumulative),
+                    borderColor: '#3b82f6', backgroundColor: 'rgba(59,130,246,0.06)',
+                    fill: true, tension: 0.35, pointRadius: 3, borderWidth: 2.5, pointBackgroundColor: '#3b82f6',
+                }, {
+                    label: 'Daily P&L',
+                    data: daily.map(d => d.pnl),
+                    borderColor: '#94a3b8', borderDash: [5, 5], fill: false, tension: 0.35,
+                    pointRadius: 2, borderWidth: 1.5, pointBackgroundColor: '#94a3b8',
+                }]
+            },
+            options: {
+                responsive: true, maintainAspectRatio: false,
+                plugins: { legend: { position: 'top', labels: { usePointStyle: true, pointStyle: 'circle', font: { size: 11, weight: '500' } } } },
+                scales: {
+                    y: { grid: { color: '#f0f2f5', drawBorder: false }, ticks: { font: { size: 10 } } },
+                    x: { grid: { display: false }, ticks: { font: { size: 10 }, maxTicksLimit: 10 } }
+                }
+            }
+        });
+        document.getElementById('pnl-updated').textContent = new Date().toLocaleTimeString();
+    } else {
+        pnlCtx.parentElement.innerHTML = '<div class="empty">No P&L data yet</div>';
+    }
+
+    // Positions
+    const posEl = document.getElementById('positions-body');
+    const posArr = Array.isArray(positions) ? positions : [];
+    if (posArr.length === 0) {
+        posEl.innerHTML = '<div class="empty">No open positions</div>';
+    } else {
+        posEl.innerHTML = `<div class="table-wrap"><table><thead><tr><th>Ticker</th><th>Side</th><th>Qty</th></tr></thead><tbody>${posArr.map(p => {
+            const yes = p.yes_count || 0, no = p.no_count || 0;
+            const side = yes > 0 ? 'yes' : 'no', qty = yes > 0 ? yes : no;
+            return `<tr><td style="font-size:11px">${p.ticker}</td><td><span class="badge badge-${side}">${side.toUpperCase()}</span></td><td>${qty}</td></tr>`;
+        }).join('')}</tbody></table></div>`;
+    }
+}
+
+// ── TRADES PAGE (grouped by day) ──────────────────
+function renderTradesByDay() {
+    const el = document.getElementById('trades-by-day');
+    if (!allTrades || allTrades.length === 0) {
+        el.innerHTML = '<div class="empty">No trades yet</div>';
+        return;
+    }
+
+    // Group by date
+    const days = {};
+    for (const t of allTrades) {
+        const day = t.timestamp.slice(0, 10);
+        if (!days[day]) days[day] = [];
+        days[day].push(t);
+    }
+
+    let html = '';
+    for (const day of Object.keys(days).sort().reverse()) {
+        const trades = days[day];
+        const invested = trades.reduce((s, t) => s + (t.cost || 0), 0);
+        const settled = trades.filter(t => t.settled);
+        const pnl = settled.reduce((s, t) => s + (t.profit || 0), 0);
+        const wins = settled.filter(t => t.profit > 0).length;
+        const pending = trades.length - settled.length;
+
+        let statsHtml = `<span>Invested: <span class="day-stat-val">${fmtDollars(invested)}</span></span>`;
+        statsHtml += `<span>Trades: <span class="day-stat-val">${trades.length}</span></span>`;
+        if (settled.length > 0) {
+            const pnlCls = pnl > 0 ? 'text-green' : pnl < 0 ? 'text-red' : '';
+            statsHtml += `<span>P&L: <span class="day-stat-val ${pnlCls}">${pnl >= 0 ? '+' : ''}${fmtDollars(pnl)}</span></span>`;
+            statsHtml += `<span>Win: <span class="day-stat-val">${wins}/${settled.length}</span></span>`;
+        }
+        if (pending > 0) {
+            statsHtml += `<span style="color:var(--text-muted)">${pending} pending</span>`;
+        }
+
+        html += `<div class="day-header"><span class="day-date">${day}</span><div class="day-stats">${statsHtml}</div></div>`;
+        html += '<div class="trade-list">';
+
+        for (const t of trades) {
+            let resultBadge;
+            if (t.settled) {
+                resultBadge = t.profit > 0
+                    ? `<span class="badge badge-win">+${fmtDollars(t.profit)}</span>`
+                    : `<span class="badge badge-loss">${fmtDollars(t.profit)}</span>`;
+            } else {
+                resultBadge = '<span class="badge badge-pending">pending</span>';
+            }
+
+            html += `<div class="trade-row">
+                <div>
+                    <div class="trade-ticker">${t.ticker}</div>
+                    <div class="trade-city">${cityFromTicker(t.ticker)}</div>
+                </div>
+                <span class="badge badge-${t.side}">${t.side.toUpperCase()}</span>
+                <span style="font-size:12px">${t.contracts}x</span>
+                <span style="font-size:12px">${fmtDollars(t.cost)}</span>
+                ${resultBadge}
+            </div>`;
+        }
+        html += '</div>';
+    }
+    el.innerHTML = html;
+}
+
+// ── PREDICTIONS PAGE ──────────────────────────────
+async function loadPredictions() {
+    document.getElementById('predictions-body').innerHTML = '<div class="loading">Fetching predictions...</div>';
+    predictionsData = await api('/api/predictions') || [];
+    renderCityFilter();
+    renderPredictions();
+}
+
+function renderCityFilter() {
+    const cities = ['all', ...new Set(predictionsData.filter(p => !p.error).map(p => p.city))];
+    document.getElementById('city-filter').innerHTML = cities.map(c =>
+        `<span class="pill ${c === selectedCity ? 'active' : ''}" onclick="selectCity('${c}')">${c === 'all' ? 'All' : c.charAt(0).toUpperCase() + c.slice(1)}</span>`
+    ).join('');
+}
+
+function selectCity(city) { selectedCity = city; renderCityFilter(); renderPredictions(); }
+
+function renderPredictions() {
+    const el = document.getElementById('predictions-body');
+    let data = predictionsData.filter(p => !p.error);
+    if (selectedCity !== 'all') data = data.filter(p => p.city === selectedCity);
+    data.sort((a, b) => Math.max(Math.abs(b.yes_edge), Math.abs(b.no_edge)) - Math.max(Math.abs(a.yes_edge), Math.abs(a.no_edge)));
+
+    if (data.length === 0) { el.innerHTML = '<div class="empty">No predictions available</div>'; return; }
+
+    el.innerHTML = `<table><thead><tr><th>Ticker</th><th>City</th><th>Model P</th><th>Yes Ask</th><th>Edge (Yes)</th><th>Edge (No)</th><th>Forecast</th></tr></thead><tbody>${data.map(p => {
+        const yeCls = p.yes_edge > 0.05 ? 'edge-pos' : 'edge-neg';
+        const neCls = p.no_edge > 0.05 ? 'edge-pos' : 'edge-neg';
+        return `<tr>
+            <td style="font-size:11px;font-family:'SF Mono',monospace">${p.ticker}</td>
+            <td>${p.city}</td>
+            <td>${fmtPct(p.model_prob)}</td>
+            <td>${fmtDollars(p.yes_ask)}</td>
+            <td class="${yeCls}">${p.yes_edge > 0 ? '+' : ''}${fmtPct(p.yes_edge)}</td>
+            <td class="${neCls}">${p.no_edge > 0 ? '+' : ''}${fmtPct(p.no_edge)}</td>
+            <td>${fmt(p.forecast_high, 1)}°F <span style="color:var(--text-muted)">±${fmt(p.error_std, 1)}</span></td>
+        </tr>`;
+    }).join('')}</tbody></table>`;
+}
+
+// ── CONTROLS PAGE ─────────────────────────────────
+async function loadStatus() {
+    const status = await api('/api/status');
+    if (!status) return;
+
+    const pill = document.getElementById('status-pill');
+    const dot = document.getElementById('status-dot');
+    const label = document.getElementById('status-label');
+    const box = document.getElementById('kill-box');
+    const kStatus = document.getElementById('kill-status');
+    const kSub = document.getElementById('kill-sub');
+    const kBtn = document.getElementById('kill-btn');
+    const hBtn = document.getElementById('kill-header-btn');
+
+    if (status.kill_switch_active) {
+        pill.className = 'status-pill killed'; dot.className = 'status-dot killed'; label.textContent = 'Stopped';
+        box.className = 'kill-box danger'; kStatus.textContent = 'Trading Stopped';
+        kSub.textContent = 'Kill switch engaged — no orders will be placed';
+        kBtn.textContent = 'Resume Trading'; kBtn.className = 'btn btn-success';
+        hBtn.textContent = 'Resume'; hBtn.className = 'header-btn resume';
+    } else {
+        pill.className = 'status-pill active'; dot.className = 'status-dot active'; label.textContent = 'Active';
+        box.className = 'kill-box safe'; kStatus.textContent = 'Trading Active';
+        kSub.textContent = 'The bot is live and placing orders normally';
+        kBtn.textContent = 'Engage Kill Switch'; kBtn.className = 'btn btn-danger';
+        hBtn.textContent = 'Kill'; hBtn.className = 'header-btn kill';
+    }
+
+    document.getElementById('next-run-text').textContent = 'Next run: ' + (status.next_run || '—');
+
+    const logEl = document.getElementById('log-viewer');
+    if (status.recent_logs && status.recent_logs.length > 0) {
+        logEl.textContent = status.recent_logs.join('\n');
+        logEl.scrollTop = logEl.scrollHeight;
+    } else { logEl.textContent = 'No logs for today yet.'; }
+}
+
+async function toggleKill() {
+    const status = await api('/api/status');
+    if (status && status.kill_switch_active) {
+        await api('/api/resume', { method: 'POST' });
+        toast('Trading resumed');
+    } else {
+        if (!confirm('Stop all automated trading?')) return;
+        await api('/api/kill', { method: 'POST' });
+        toast('Kill switch engaged');
+    }
+    loadStatus();
+}
+
+async function triggerRun(dryRun) {
+    if (!dryRun && !confirm('Place REAL orders with real money?')) return;
+    const result = await api('/api/run', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dry_run: dryRun }),
+    });
+    if (result && result.status && result.status.includes('error')) toast('A run is already in progress');
+    else if (result) toast('Started ' + (dryRun ? 'dry' : 'live') + ' run');
+}
+
+async function checkSettlements() {
+    const btn = document.getElementById('settle-btn');
+    btn.disabled = true; btn.textContent = '...';
+    const result = await api('/api/settle', { method: 'POST' });
+    if (result && result.settled != null) {
+        toast(result.settled > 0 ? `Settled ${result.settled} trade(s)` : 'No new settlements');
+        loadOverview();
+        renderTradesByDay();
+    } else { toast('Error checking settlements'); }
+    btn.disabled = false; btn.textContent = 'Settle';
+}
+
+// ── MODEL HEALTH PAGE ─────────────────────────────
+async function loadModelHealth() {
+    const [health, cal] = await Promise.all([api('/api/model_health'), api('/api/calibration')]);
+    modelHealthData = health;
+
+    const mEl = document.getElementById('model-metrics');
+    if (health && health.models) {
+        const items = [];
+        for (const [city, m] of Object.entries(health.models)) {
+            items.push({ label: city.charAt(0).toUpperCase() + city.slice(1) + ' MAE', value: m.train_mae + '°F', sub: m.model_name });
+        }
+        for (const [city, n] of Object.entries(health.data_size || {})) {
+            items.push({ label: city.charAt(0).toUpperCase() + city.slice(1) + ' Data', value: n + ' days' });
+        }
+        mEl.innerHTML = items.map(m => `<div class="metric-card"><div class="metric-label">${m.label}</div><div class="metric-value">${m.value}</div>${m.sub ? `<div class="metric-sub">${m.sub}</div>` : ''}</div>`).join('');
+    }
+
+    // Calibration chart
+    const calCtx = document.getElementById('cal-chart');
+    if (calChart) calChart.destroy();
+    if (cal && cal.buckets && cal.buckets.length > 0) {
+        calChart = new Chart(calCtx, {
+            type: 'scatter',
+            data: { datasets: [
+                { label: 'Calibration', data: cal.buckets.map(b => ({ x: b.predicted, y: b.actual })), backgroundColor: '#3b82f6', pointRadius: 6, pointHoverRadius: 8 },
+                { label: 'Perfect', data: [{x:0,y:0},{x:1,y:1}], type: 'line', borderColor: '#d1d5db', borderDash: [5,5], pointRadius: 0, borderWidth: 1.5, fill: false },
+            ]},
+            options: { responsive: true, maintainAspectRatio: false,
+                scales: { x: { title: { display: true, text: 'Predicted', font: {size:11} }, min:0, max:1, grid:{color:'#f0f2f5'} }, y: { title: { display: true, text: 'Actual', font: {size:11} }, min:0, max:1, grid:{color:'#f0f2f5'} } },
+                plugins: { legend: { display: false } }
+            }
+        });
+        document.getElementById('brier-score').textContent = `Brier: ${cal.brier} (0.25 = random) — ${cal.n} trades`;
+    } else { calCtx.parentElement.innerHTML = '<div class="empty">Not enough data for calibration</div>'; }
+
+    // Coefficients
+    const coefEl = document.getElementById('coef-body');
+    if (health && health.models) {
+        let html = '';
+        for (const [city, m] of Object.entries(health.models)) {
+            const coefs = m.coefficients || m.importances || {};
+            const entries = Object.entries(coefs).sort((a,b) => Math.abs(b[1]) - Math.abs(a[1]));
+            if (!entries.length) continue;
+            const maxAbs = Math.max(...entries.map(([,v]) => Math.abs(v)));
+            html += `<div class="coef-section"><div class="coef-city-label">${city.charAt(0).toUpperCase()+city.slice(1)} <span class="model-badge">${m.model_name}</span></div>`;
+            for (const [name, val] of entries) {
+                const pct = Math.abs(val) / maxAbs * 44;
+                html += `<div class="coef-row"><span class="coef-label">${name}</span><div class="coef-track"><div class="coef-bar ${val>=0?'pos':'neg'}" style="width:${pct}%"></div></div><span class="coef-val">${val>=0?'+':''}${val.toFixed(4)}</span></div>`;
+            }
+            html += '</div>';
+        }
+        coefEl.innerHTML = html || '<div class="empty">No model data</div>';
+    }
+    renderMaeChart(health);
+}
+
+function renderMaeChart(health) {
+    if (!health || !health.tracking) return;
+    const cities = Object.keys(health.tracking);
+    if (!cities.length) { document.getElementById('mae-chart').parentElement.innerHTML = '<div class="empty">No tracking data</div>'; return; }
+    if (!cities.includes(selectedMaeCity)) selectedMaeCity = cities[0];
+
+    document.getElementById('mae-city-filter').innerHTML = cities.map(c =>
+        `<span class="pill ${c===selectedMaeCity?'active':''}" onclick="selectMaeCity('${c}')">${c.charAt(0).toUpperCase()+c.slice(1)}</span>`
+    ).join('');
+
+    const data = health.tracking[selectedMaeCity] || [];
+    if (!data.length) return;
+    const ctx = document.getElementById('mae-chart');
+    if (maeChart) maeChart.destroy();
+    maeChart = new Chart(ctx, {
+        type: 'line',
+        data: { labels: data.map(d=>d.date), datasets: [
+            { label: 'Model', data: data.map(d => d.model_error!=null ? Math.abs(d.model_error) : null), borderColor: '#3b82f6', borderWidth: 2.5, pointRadius: 3, tension: 0.35, spanGaps: true, pointBackgroundColor: '#3b82f6' },
+            { label: 'GFS', data: data.map(d => d.gfs_error!=null ? Math.abs(d.gfs_error) : null), borderColor: '#10b981', borderWidth: 1.5, pointRadius: 2, tension: 0.35, borderDash: [5,5], spanGaps: true },
+            { label: 'ECMWF', data: data.map(d => d.ecmwf_error!=null ? Math.abs(d.ecmwf_error) : null), borderColor: '#ef4444', borderWidth: 1.5, pointRadius: 2, tension: 0.35, borderDash: [5,5], spanGaps: true },
+        ]},
+        options: { responsive: true, maintainAspectRatio: false,
+            plugins: { legend: { position: 'top', labels: { usePointStyle: true, pointStyle: 'circle', font: {size:11,weight:'500'} } } },
+            scales: { y: { title: { display: true, text: 'Abs Error (°F)', font:{size:11} }, grid:{color:'#f0f2f5',drawBorder:false} }, x: { grid:{display:false}, ticks:{font:{size:10},maxTicksLimit:10} } }
+        }
+    });
+}
+function selectMaeCity(city) { selectedMaeCity = city; if (modelHealthData) renderMaeChart(modelHealthData); }
+
+// ── Init & lazy-load ──────────────────────────────
+const loaded = { overview: true, trades: false, predictions: false, controls: true, model: false };
+
+document.querySelectorAll('.header-tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+        const page = tab.dataset.page;
+        if (page === 'trades' && !loaded.trades) { loaded.trades = true; renderTradesByDay(); }
+        if (page === 'predictions' && !loaded.predictions) { loaded.predictions = true; loadPredictions(); }
+        if (page === 'model' && !loaded.model) { loaded.model = true; loadModelHealth(); }
+        if (page === 'controls') loadStatus();
+        if (page === 'overview') loadOverview();
+    });
+});
+
+setInterval(() => {
+    loadOverview();
+    loadStatus();
+    if (loaded.trades) renderTradesByDay();
+    if (loaded.predictions) loadPredictions();
+    if (loaded.model) loadModelHealth();
+}, 60000);
+
+loadOverview();
+loadStatus();
+</script>
+</body>
+</html>

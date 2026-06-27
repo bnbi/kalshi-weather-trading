@@ -13,6 +13,8 @@ This script ties everything together:
 5. Outputs recommended trades
 """
 
+from __future__ import annotations
+
 import requests
 from dataclasses import dataclass
 
@@ -42,7 +44,7 @@ def get_market_prices(series_ticker: str) -> list[dict]:
         "limit": 200,
         "status": "open",
         "series_ticker": series_ticker,
-    })
+    }, timeout=15)
     resp.raise_for_status()
     return resp.json().get("markets", [])
 
@@ -68,6 +70,40 @@ def calculate_edge(predictions: list[ContractPrediction],
             "volume": m.get("volume_fp", m.get("volume", "0")),
         }
 
+    # Maximum credible disagreement — if our model disagrees with the market
+    # by more than this, the market almost certainly knows something we don't
+    # (intraday obs, newer model runs). These trades are SKIPPED, not capped.
+    #
+    # Evidence (89 settled trades through 2026-06-11): trades with raw
+    # disagreement >25¢ lost $31.54 in aggregate; trades within the band
+    # made +$8.68. Capping the edge but still trading was the single
+    # largest source of losses.
+    MAX_CREDIBLE_EDGE = 0.25
+
+    # Market-prior shrinkage: the market price is treated as a Bayesian
+    # prior and our model only moves us partway off it.
+    #     blended_prob = MODEL_WEIGHT * model_prob + (1 - MODEL_WEIGHT) * price
+    # Live calibration showed the model claiming ~95% on bets that won 75%,
+    # while the market price was nearly unbiased. Blending halves phantom
+    # edge and shrinks Kelly stakes toward sanity. With MODEL_WEIGHT = 0.5,
+    # clearing a 7¢ min edge requires a raw model-market gap of 14¢.
+    MODEL_WEIGHT = 0.5
+
+    # ── Trade selection rules (based on 75-trade P&L analysis) ─────
+    #
+    # Our model's strength is identifying outcomes that WON'T happen.
+    # Buying NO on high-confidence outcomes: 92% win rate, +17% ROI.
+    # Buying YES on speculative outcomes:    8% win rate, -75% ROI.
+    #
+    # Rules:
+    # 1. NO bets: only take when market price ≥ 68 cents (high-confidence)
+    # 2. YES bets on brackets: NEVER — model can't pick specific 1°F ranges
+    # 3. YES bets on thresholds: only when market price ≥ 13 cents
+    #    (avoid cheap lottery tickets that almost never pay off)
+    MIN_NO_PRICE = 0.68     # only buy NO at 68c or above
+    MIN_YES_PRICE = 0.13    # only buy YES at 13c or above
+    ALLOW_BRACKET_YES = False  # bracket YES bets are -80% ROI — never take them
+
     signals = []
 
     for pred in predictions:
@@ -85,37 +121,52 @@ def calculate_edge(predictions: list[ContractPrediction],
         if (yes_ask <= 0.02 and no_ask >= 0.98) or (yes_ask >= 0.98 and no_ask <= 0.02):
             continue
 
-        # Edge on buying YES: we think P(yes) = model_prob, market charges yes_ask
-        # EV of buying yes = model_prob * $1 - yes_ask
-        yes_edge = pred.model_probability - yes_ask
+        # Raw disagreement with the market, per side
+        raw_yes = pred.model_probability - yes_ask
+        raw_no = (1 - pred.model_probability) - no_ask
 
-        # Edge on buying NO: we think P(no) = 1 - model_prob, market charges no_ask
-        # EV of buying no = (1 - model_prob) * $1 - no_ask
-        no_edge = (1 - pred.model_probability) - no_ask
+        # Blend model with market prior. Since blended = w*model + (1-w)*price,
+        # the blended edge is simply w * (model - price).
+        yes_blend_prob = MODEL_WEIGHT * pred.model_probability + (1 - MODEL_WEIGHT) * yes_ask
+        no_blend_prob = MODEL_WEIGHT * (1 - pred.model_probability) + (1 - MODEL_WEIGHT) * no_ask
+        yes_edge = yes_blend_prob - yes_ask
+        no_edge = no_blend_prob - no_ask
 
-        # Signal a trade if edge exceeds threshold
-        if yes_edge >= min_edge:
-            signals.append(TradeSignal(
-                ticker=pred.ticker,
-                side="yes",
-                action="buy",
-                model_prob=pred.model_probability,
-                market_price=yes_ask,
-                edge=yes_edge,
-                expected_value=yes_edge,  # per $1 notional
-                description=f"BUY YES @ ${yes_ask:.2f} | Model: {pred.model_probability:.1%} | {pred.description}",
-            ))
+        # Distrust filter: SKIP (don't cap) implausible disagreements
+        yes_credible = raw_yes <= MAX_CREDIBLE_EDGE
+        no_credible = raw_no <= MAX_CREDIBLE_EDGE
 
-        if no_edge >= min_edge:
+        # Signal YES trade (with strict filters)
+        if yes_credible and yes_edge >= min_edge and yes_ask >= MIN_YES_PRICE:
+            # Block bracket YES bets entirely — model can't pick 1°F ranges
+            is_bracket = pred.contract_type == "bracket"
+            if is_bracket and not ALLOW_BRACKET_YES:
+                pass  # skip
+            else:
+                signals.append(TradeSignal(
+                    ticker=pred.ticker,
+                    side="yes",
+                    action="buy",
+                    model_prob=yes_blend_prob,
+                    market_price=yes_ask,
+                    edge=yes_edge,
+                    expected_value=yes_edge,
+                    description=f"BUY YES @ ${yes_ask:.2f} | Model: {pred.model_probability:.1%} "
+                                f"(blended {yes_blend_prob:.1%}) | {pred.description}",
+                ))
+
+        # Signal NO trade
+        if no_credible and no_edge >= min_edge and no_ask >= MIN_NO_PRICE:
             signals.append(TradeSignal(
                 ticker=pred.ticker,
                 side="no",
                 action="buy",
-                model_prob=1 - pred.model_probability,
+                model_prob=no_blend_prob,
                 market_price=no_ask,
                 edge=no_edge,
                 expected_value=no_edge,
-                description=f"BUY NO @ ${no_ask:.2f} | Model: {1 - pred.model_probability:.1%} | {pred.description}",
+                description=f"BUY NO @ ${no_ask:.2f} | Model: {1 - pred.model_probability:.1%} "
+                            f"(blended {no_blend_prob:.1%}) | {pred.description}",
             ))
 
     # Sort by edge (best opportunities first)
@@ -123,7 +174,7 @@ def calculate_edge(predictions: list[ContractPrediction],
     return signals
 
 
-def parse_price(price_str) -> float:
+def parse_price(price_str: object) -> float | None:
     """Parse a price string like '0.4300' into a float."""
     if price_str is None:
         return None
@@ -133,7 +184,7 @@ def parse_price(price_str) -> float:
         return None
 
 
-def print_signals(signals: list[TradeSignal], city_name: str):
+def print_signals(signals: list[TradeSignal], city_name: str) -> None:
     """Pretty-print trade signals."""
     print(f"\n{'=' * 80}")
     print(f"  TRADE SIGNALS — {city_name}")
@@ -154,7 +205,7 @@ def print_signals(signals: list[TradeSignal], city_name: str):
         print()
 
 
-def print_full_comparison(predictions: list[ContractPrediction], markets: list[dict]):
+def print_full_comparison(predictions: list[ContractPrediction], markets: list[dict]) -> None:
     """Print a full comparison table of model vs market."""
     market_lookup = {m["ticker"]: m for m in markets}
 

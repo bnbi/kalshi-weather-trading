@@ -1,6 +1,8 @@
-# Kalshi API Configuration
-# Copy this file to config.py and fill in your credentials
-# NEVER commit config.py to git — it contains your private key
+"""
+Kalshi API Configuration Template
+Copy this file to config.py and fill in your credentials.
+NEVER commit config.py to git -- it contains your private key.
+"""
 
 # Your Kalshi API Key ID (from https://kalshi.com/account/api)
 KALSHI_API_KEY_ID = "your-api-key-id-here"
