@@ -73,7 +73,7 @@ VALIDATION_MAX_CALIB_GAP = 0.15   # claimed prob may exceed realized win rate by
 # the validation gate only counts signals scored by the CURRENT model. Signals
 # logged before this tag existed have model_version = NULL (the old, badly
 # overconfident max(obs+spike, forecast) model) and are excluded from the gate.
-MODEL_VERSION = "fh-rem-forecast-v2"
+MODEL_VERSION = "fh-bracket-only-v3"
 
 
 # ── Database ────────────────────────────────────────────────────────
@@ -295,6 +295,12 @@ def find_sniper_signals(city_key: str, local_date: str,
         if kalshi_date not in ticker:
             continue
         info = parse_contract_ticker(ticker)
+        # Skip threshold contracts — 1W/14L (7% win rate) in validation.
+        # The Monte Carlo model is badly miscalibrated on thresholds; bracket
+        # NO bets are 22W/1L (96%). Only trade brackets until threshold logic
+        # is diagnosed and fixed.
+        if info.get("type") == "threshold":
+            continue
         p_yes = contract_prob_yes(samples, info, m.get("title", ""))
         if p_yes is None:
             continue
@@ -430,22 +436,36 @@ def run(cities: list[str] = None, mode: str = "dry", budget: float = DEFAULT_BUD
         conn.close()
         return
 
-    # Log every signal (dry or live) for validation
+    # Log every signal (dry or live) for validation.
+    # Deduplicate: skip if we already logged this (date, ticker, side) today —
+    # multiple runs per day would otherwise inflate signal count and make
+    # validation stats noisy with correlated duplicates.
     now_iso = datetime.now(timezone.utc).isoformat()
+    logged = 0
     for ck, s, ctx in all_signals:
         tz = ZoneInfo(CITIES[ck].timezone)
+        local_date = datetime.now(tz).strftime("%Y-%m-%d")
+        already = conn.execute("""
+            SELECT 1 FROM sniper_signals
+            WHERE date = ? AND ticker = ? AND side = ? LIMIT 1
+        """, (local_date, s.ticker, s.side)).fetchone()
+        if already:
+            continue
         conn.execute("""
             INSERT INTO sniper_signals
             (created_at, date, city, ticker, side, prob, ask_price,
              obs_max_f, rem_max_f, hours_remaining, mode, model_version)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (now_iso, datetime.now(tz).strftime("%Y-%m-%d"), ck, s.ticker, s.side,
+        """, (now_iso, local_date, ck, s.ticker, s.side,
               s.model_prob, s.market_price,
               ctx["obs"]["obs_max_f"] if ctx["obs"] else None,
               ctx["rem"]["rem_max_f"] if ctx["rem"] else None,
               ctx["rem"]["hours_remaining"] if ctx["rem"] else None,
               mode, MODEL_VERSION))
+        logged += 1
     conn.commit()
+    if logged < len(all_signals):
+        print(f"  ({len(all_signals) - logged} duplicate signal(s) skipped — already logged today)")
 
     print(f"\n  {len(all_signals)} signal(s) [{mode.upper()}]:")
     for ck, s, _ in all_signals:
