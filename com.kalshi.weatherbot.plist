@@ -6,12 +6,17 @@
     <key>Label</key>
     <string>com.kalshi.weatherbot</string>
 
-    <!-- What to run -->
+    <!-- What to run.
+         Paper mode by default (--dry-run): the next-day strategy showed ~zero
+         edge live (see RESEARCH.md), so it runs but places no real orders. To
+         trade real money, remove --dry-run AND ensure config.py + the API key
+         are present. -->
     <key>ProgramArguments</key>
     <array>
         <string>/Users/brianbi/kalshi-bot/venv/bin/python</string>
         <string>/Users/brianbi/kalshi-bot/scheduler.py</string>
         <string>run</string>
+        <string>--dry-run</string>
         <string>--max-spend</string>
         <string>10</string>
     </array>
@@ -20,7 +25,7 @@
     <key>WorkingDirectory</key>
     <string>/Users/brianbi/kalshi-bot</string>
 
-    <!-- Run daily at 7:00 AM local time -->
+    <!-- Run daily at 10:00 AM local time -->
     <key>StartCalendarInterval</key>
     <dict>
         <key>Hour</key>

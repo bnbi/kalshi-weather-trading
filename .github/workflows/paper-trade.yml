@@ -1,0 +1,47 @@
+name: Paper trade (scheduled dry run)
+
+# Runs the full decision pipeline in DRY / paper mode on GitHub's infrastructure,
+# so the system executes on a schedule with no machine of the author's kept awake
+# and NO real money or API credentials involved. It fetches public market and
+# weather data, generates predictions and edge signals, prints the trade plan it
+# *would* place, and uploads the run log as an artifact.
+#
+# Live trading is intentionally NOT wired here — that requires private Kalshi
+# credentials and is an explicit, manual opt-in (see README "Automation").
+
+on:
+  schedule:
+    - cron: "20 18 * * *"   # 18:20 UTC daily (mid-afternoon US Eastern)
+  workflow_dispatch:          # allow manual runs from the Actions tab
+
+jobs:
+  paper-trade:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run pipeline in paper mode
+        # Non-zero exits (e.g. a transient weather/market API hiccup, or simply
+        # "no edge found today") must not fail the scheduled job — the purpose is
+        # to exercise and record the pipeline, not to gate on market conditions.
+        continue-on-error: true
+        run: |
+          mkdir -p logs
+          python scheduler.py run --dry-run 2>&1 | tee logs/paper_run.log
+
+      - name: Upload run log
+        uses: actions/upload-artifact@v4
+        with:
+          name: paper-run-log
+          path: logs/paper_run.log
+          retention-days: 14

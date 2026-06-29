@@ -1,5 +1,8 @@
 # Kalshi Weather Trading System
 
+<!-- Update USER/REPO below to your GitHub path once pushed -->
+[![CI](https://github.com/USER/REPO/actions/workflows/ci.yml/badge.svg)](https://github.com/USER/REPO/actions/workflows/ci.yml)
+
 An end-to-end automated trading system for Kalshi daily-high-temperature
 markets: multi-model ensemble forecasting, ML bias correction, calibrated
 probability estimation, Bayesian shrinkage against the market prior,
@@ -135,10 +138,14 @@ python historical_data.py chicago --days 365   # repeat per city
 python train_all_cities.py
 
 python scheduler.py run --dry-run    # verify pipeline
-bash setup_schedule.sh               # daily 7am trading via launchd
-bash setup_sniper.sh                 # hourly afternoon sniper (starts dry)
+bash setup_schedule.sh               # daily 10am paper run via launchd
+bash setup_sniper.sh                 # hourly afternoon sniper (self-gating)
 python dashboard_app.py              # monitoring at localhost:5050
 ```
+
+For fully hands-off operation without keeping a machine awake, the GitHub
+Actions paper-trade workflow runs the pipeline on a schedule in the cloud — see
+**Automation & safety** below.
 
 ## CLI reference
 
@@ -151,7 +158,31 @@ python backtest.py --all --chart                      # walk-forward backtest
 python pnl_tracker.py summary|daily|calibration       # performance & scoring
 python find_edge.py chicago --show-all                # model vs market table
 python train_all_cities.py                            # retrain models
+pytest -q                                             # run the test suite
 ```
+
+## Automation & safety
+
+The system is designed to run **hands-off and money-safe by default**:
+
+- **Serverless schedule (no machine of your own).** A GitHub Actions workflow
+  ([`.github/workflows/paper-trade.yml`](.github/workflows/paper-trade.yml))
+  runs the full decision pipeline daily in **paper mode** on GitHub's
+  infrastructure — fetching public market and weather data, generating
+  predictions and edge signals, and printing the trade plan it *would* place. It
+  uses no API credentials and places no real orders.
+- **Continuous integration.** Every push runs the test suite
+  ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) over the core
+  quantitative logic (Kelly sizing, calibration, probability model, edge +
+  shrinkage, the self-validation gate) — see [`tests/`](tests/).
+- **Local automation is paper by default too.** The launchd jobs run
+  `scheduler.py --dry-run`; the same-day sniper runs `--auto`, which logs every
+  signal but trades real money only after its self-validation gate passes
+  (≥15 verified signals, positive EV, ≤15pt calibration gap).
+- **Live trading is an explicit opt-in.** It requires placing your Kalshi
+  credentials (`config.py` + RSA key) on the host and removing `--dry-run`.
+  Given live results showed ≈ zero edge in next-day markets, the defaults
+  prioritise a correct, observable system over chasing thin returns.
 
 ## Known limitations
 
