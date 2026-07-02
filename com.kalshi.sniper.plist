@@ -10,8 +10,8 @@
          P&L, honest calibration). Until then every run is a logged dry run. -->
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/brianbi/kalshi-bot/venv/bin/python</string>
-        <string>/Users/brianbi/kalshi-bot/sniper.py</string>
+        <string>/Users/YOUR_USERNAME/kalshi-bot/venv/bin/python</string>
+        <string>/Users/YOUR_USERNAME/kalshi-bot/sniper.py</string>
         <string>run</string>
         <string>--auto</string>
         <string>--budget</string>
@@ -19,7 +19,7 @@
     </array>
 
     <key>WorkingDirectory</key>
-    <string>/Users/brianbi/kalshi-bot</string>
+    <string>/Users/YOUR_USERNAME/kalshi-bot</string>
 
     <!-- Hourly through the afternoon (local time). The sniper itself skips
          any city whose local time is outside 13:00-21:00. -->
@@ -36,16 +36,16 @@
     </array>
 
     <key>StandardOutPath</key>
-    <string>/Users/brianbi/kalshi-bot/logs/sniper_stdout.log</string>
+    <string>/Users/YOUR_USERNAME/kalshi-bot/logs/sniper_stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/brianbi/kalshi-bot/logs/sniper_stderr.log</string>
+    <string>/Users/YOUR_USERNAME/kalshi-bot/logs/sniper_stderr.log</string>
 
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/Users/brianbi/kalshi-bot/venv/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <string>/Users/YOUR_USERNAME/kalshi-bot/venv/bin:/usr/local/bin:/usr/bin:/bin</string>
         <key>PYTHONPATH</key>
-        <string>/Users/brianbi/kalshi-bot</string>
+        <string>/Users/YOUR_USERNAME/kalshi-bot</string>
     </dict>
 
     <key>KeepAlive</key>

@@ -13,8 +13,8 @@
          are present. -->
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/brianbi/kalshi-bot/venv/bin/python</string>
-        <string>/Users/brianbi/kalshi-bot/scheduler.py</string>
+        <string>/Users/YOUR_USERNAME/kalshi-bot/venv/bin/python</string>
+        <string>/Users/YOUR_USERNAME/kalshi-bot/scheduler.py</string>
         <string>run</string>
         <string>--dry-run</string>
         <string>--max-spend</string>
@@ -23,7 +23,7 @@
 
     <!-- Working directory -->
     <key>WorkingDirectory</key>
-    <string>/Users/brianbi/kalshi-bot</string>
+    <string>/Users/YOUR_USERNAME/kalshi-bot</string>
 
     <!-- Run daily at 10:00 AM local time -->
     <key>StartCalendarInterval</key>
@@ -36,17 +36,17 @@
 
     <!-- Stdout/stderr logging -->
     <key>StandardOutPath</key>
-    <string>/Users/brianbi/kalshi-bot/logs/launchd_stdout.log</string>
+    <string>/Users/YOUR_USERNAME/kalshi-bot/logs/launchd_stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/brianbi/kalshi-bot/logs/launchd_stderr.log</string>
+    <string>/Users/YOUR_USERNAME/kalshi-bot/logs/launchd_stderr.log</string>
 
     <!-- Environment variables (ensure Python can find modules) -->
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/Users/brianbi/kalshi-bot/venv/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <string>/Users/YOUR_USERNAME/kalshi-bot/venv/bin:/usr/local/bin:/usr/bin:/bin</string>
         <key>PYTHONPATH</key>
-        <string>/Users/brianbi/kalshi-bot</string>
+        <string>/Users/YOUR_USERNAME/kalshi-bot</string>
     </dict>
 
     <!-- Don't restart if it crashes — we only want one run per day -->
