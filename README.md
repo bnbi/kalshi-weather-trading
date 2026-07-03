@@ -1,7 +1,6 @@
 # Kalshi Weather Trading System
 
-<!-- Update USER/REPO below to your GitHub path once pushed -->
-[![CI](https://github.com/USER/REPO/actions/workflows/ci.yml/badge.svg)](https://github.com/USER/REPO/actions/workflows/ci.yml)
+[![CI](https://github.com/bnbi/kalshi-weather-trading/actions/workflows/ci.yml/badge.svg)](https://github.com/bnbi/kalshi-weather-trading/actions/workflows/ci.yml)
 
 An end-to-end automated trading system for Kalshi daily-high-temperature
 markets: multi-model ensemble forecasting, ML bias correction, calibrated
