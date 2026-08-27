@@ -141,6 +141,17 @@ def size_orders(signals: list[TradeSignal], bankroll: float,
         contracts = int(dollars_to_risk / signal.market_price)
         contracts = min(contracts, max_contracts)
 
+        # Floor: with a small bankroll, fractional Kelly often suggests less
+        # than one contract's cost. If the signal cleared the edge threshold
+        # and one contract fits within the position cap and remaining budget,
+        # trade minimum size rather than sitting out entirely. Kelly sizing
+        # takes over naturally once the bankroll grows.
+        if contracts == 0:
+            one_contract_cost = signal.market_price
+            if (one_contract_cost <= max_position_dollars
+                    and one_contract_cost <= remaining_budget):
+                contracts = 1
+
         if contracts <= 0:
             continue
 
@@ -420,20 +431,19 @@ def run_trading_pipeline(city_key: str, dry_run: bool = True,
     """
     city = CITIES[city_key]
 
-    # Load risk config from config.py if available
+    # Load risk config from config.py if available.
+    # Sizing is percentage-of-bankroll: the dollar limits are computed
+    # AFTER the bankroll is known (below), so they scale automatically.
     try:
         import config
         kelly_fraction = getattr(config, "KELLY_FRACTION", kelly_fraction)
-        max_position = getattr(config, "MAX_POSITION_SIZE_CENTS", 500) / 100
-        max_exposure = getattr(config, "MAX_TOTAL_EXPOSURE_CENTS", 5000) / 100
+        max_position_pct = getattr(config, "MAX_POSITION_PCT", 0.08)
+        max_exposure_pct = getattr(config, "MAX_RUN_EXPOSURE_PCT", 0.25)
         max_positions = getattr(config, "MAX_OPEN_POSITIONS", DEFAULT_MAX_POSITIONS)
     except ImportError:
-        max_position = DEFAULT_MAX_POSITION_DOLLARS
-        max_exposure = DEFAULT_MAX_EXPOSURE_DOLLARS
+        max_position_pct = 0.08
+        max_exposure_pct = 0.25
         max_positions = DEFAULT_MAX_POSITIONS
-
-    if max_spend is not None:
-        max_exposure = min(max_exposure, max_spend)
 
     # Step 1: Get markets and predictions
     print(f"Fetching {city.name} weather markets...")
@@ -474,14 +484,18 @@ def run_trading_pipeline(city_key: str, dry_run: bool = True,
             print("  ERROR: No funds available. Deposit money first.")
             return []
 
-        # CRITICAL: Never try to spend more than available balance
-        # This prevents overdraft when config allows higher exposure
-        if max_exposure > bankroll:
-            print(f"  Capping max exposure ${max_exposure:.2f} → ${bankroll:.2f} (available balance)")
-            max_exposure = bankroll
-        if max_position > bankroll:
-            max_position = min(max_position, bankroll)
+    # Percentage caps -> dollar limits for THIS bankroll (scale-invariant).
+    # max_spend (per-city budget from the scheduler) still applies on top.
+    max_position = bankroll * max_position_pct
+    max_exposure = bankroll * max_exposure_pct
+    if max_spend is not None:
+        max_exposure = min(max_exposure, max_spend)
+    max_exposure = min(max_exposure, bankroll)  # never overdraft
+    print(f"  Sizing: {kelly_fraction:.0%} Kelly, position cap "
+          f"${max_position:.2f} ({max_position_pct:.0%}), run cap "
+          f"${max_exposure:.2f}")
 
+    if not dry_run:
         # Check existing positions
         tickers = [s.ticker for s in signals]
         existing = check_existing_positions(client, tickers)

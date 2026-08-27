@@ -8,6 +8,10 @@ Sources:
     2. Open-Meteo / GFS — NOAA's Global Forecast System
     3. Open-Meteo / ECMWF — European model (often the best globally)
     4. Open-Meteo / Best Match — Open-Meteo's own blended forecast
+    5. Open-Meteo / ICON — German DWD model
+    6. Apple WeatherKit — Apple's post-processed forecast (optional; needs
+       credentials in config.py). Not a raw NWP model, so its errors are
+       the least correlated with the rest of the ensemble.
 
 The ensemble forecast is more accurate than any single source because:
 - Individual model errors are partially independent
@@ -24,6 +28,16 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 
 from weather import CITIES, City, get_daily_high_forecast
+import weatherkit
+
+
+def _wk_config(name: str, default):
+    """Read a WEATHERKIT_* setting from config.py, falling back to default."""
+    try:
+        import config
+        return getattr(config, name, default)
+    except ImportError:
+        return default
 
 
 OPEN_METEO_HEADERS = {
@@ -61,6 +75,13 @@ class EnsembleForecast:
     # Live bias correction is clipped to this range (°F) to prevent a few
     # bad verification days from swinging predictions.
     MAX_BIAS_CORRECTION = 1.5
+
+    # Apple WeatherKit has no forecast archive, so it cannot be backfilled
+    # into the training set the way ICON was. Instead it is applied as a
+    # post-hoc shrinkage toward Apple's number, with a single weight fitted
+    # on the live verified rows. Defaults are overridable from config.py.
+    WK_MIN_VERIFIED_DAYS = 45
+    WK_MAX_WEIGHT = 0.35
 
     def compute(self):
         """
@@ -114,10 +135,20 @@ class EnsembleForecast:
                 correction = max(-self.MAX_BIAS_CORRECTION,
                                  min(self.MAX_BIAS_CORRECTION, bias))
                 self.ensemble_high_f = round(self.ensemble_high_f - correction, 1)
-                base_std = max(live_std, self.MIN_LIVE_STD)
+                # Take the LARGER of live-verified σ and the model's
+                # (possibly day-specific) σ — conservative for Kelly sizing.
+                base_std = max(live_std, ml_result["uncertainty_std"],
+                               self.MIN_LIVE_STD)
             else:
                 # No live data — fall back to the conservative floor.
                 base_std = max(ml_result["uncertainty_std"], self.MIN_UNCERTAINTY_STD)
+
+            # ── Apple WeatherKit shrinkage ──────────────────────────
+            # Nudge the ML point forecast toward Apple's, by a weight
+            # learned from how much Apple's disagreement has historically
+            # predicted the model's own error. No-ops until there is
+            # enough verified history.
+            self._apply_weatherkit_blend()
 
             spread_inflation = self.model_spread / 4.0  # more disagreement → more uncertainty
             self.ensemble_std = base_std + spread_inflation
@@ -143,7 +174,7 @@ class EnsembleForecast:
         if not model_path or not os.path.exists(model_path):
             return None
 
-        # Extract GFS, ECMWF, and blend forecasts from sources
+        # Extract GFS, ECMWF, blend (+ optional ICON) forecasts from sources
         source_map = {}
         for s in self.sources:
             name = s.source.lower()
@@ -151,6 +182,10 @@ class EnsembleForecast:
                 source_map["gfs"] = s.high_f
             elif "ecmwf" in name:
                 source_map["ecmwf"] = s.high_f
+            elif "icon" in name:
+                source_map["icon"] = s.high_f
+            elif "weatherkit" in name or "apple" in name:
+                source_map["weatherkit"] = s.high_f
             elif "best_match" in name or "blend" in name:
                 source_map["blend"] = s.high_f
 
@@ -180,6 +215,8 @@ class EnsembleForecast:
                 gfs=source_map["gfs"],
                 ecmwf=source_map["ecmwf"],
                 blend=source_map["blend"],
+                icon=source_map.get("icon"),  # optional 4th source
+                weatherkit=source_map.get("weatherkit"),  # optional 5th source
                 month=dt.month,
                 day_of_year=dt.timetuple().tm_yday,
                 model_path=model_path,
@@ -189,6 +226,84 @@ class EnsembleForecast:
         except Exception as e:
             print(f"  Warning: trained model failed, using naive average: {e}")
             return None
+
+    def _weatherkit_high(self) -> float | None:
+        """Apple's forecast from this ensemble's sources, if present."""
+        for s in self.sources:
+            name = s.source.lower()
+            if "weatherkit" in name or "apple" in name:
+                return s.high_f
+        return None
+
+    def _apply_weatherkit_blend(self) -> None:
+        """
+        Shrink the ML prediction toward Apple's forecast by a learned weight.
+
+        The weight w solves min_w Σ (actual - [pred + w·(apple - pred)])²
+        over verified live rows — i.e. an OLS through the origin of the
+        model's residual on Apple's disagreement. w = 0 means Apple adds
+        nothing beyond the ML model; w > 0 means Apple systematically
+        points in the direction the model was wrong.
+        """
+        wk = self._weatherkit_high()
+        if wk is None or self.ensemble_high_f is None:
+            return
+        if _wk_config("WEATHERKIT_MODE", "shadow") != "blend":
+            return
+
+        weight = self._get_weatherkit_weight()
+        if not weight:
+            return
+
+        self.ensemble_high_f = round(
+            self.ensemble_high_f + weight * (wk - self.ensemble_high_f), 1)
+
+    def _get_weatherkit_weight(self) -> float:
+        """
+        Fit the WeatherKit shrinkage weight from verified live predictions.
+        Returns 0.0 when there is not yet enough data to estimate it.
+        """
+        city_key = self._get_city_key()
+        if not city_key:
+            return 0.0
+
+        min_days = _wk_config("WEATHERKIT_MIN_VERIFIED_DAYS",
+                              self.WK_MIN_VERIFIED_DAYS)
+        max_weight = _wk_config("WEATHERKIT_MAX_WEIGHT", self.WK_MAX_WEIGHT)
+
+        try:
+            import sqlite3
+            from pathlib import Path
+            db_path = Path(os.path.dirname(__file__)) / "kalshi_data.db"
+            conn = sqlite3.connect(str(db_path))
+            rows = conn.execute("""
+                SELECT model_prediction_f, wk_forecast_f, actual_high_f
+                FROM daily_predictions
+                WHERE city = ?
+                  AND model_prediction_f IS NOT NULL
+                  AND wk_forecast_f IS NOT NULL
+                  AND actual_high_f IS NOT NULL
+                ORDER BY date DESC LIMIT 120
+            """, (city_key,)).fetchall()
+            conn.close()
+        except Exception:
+            return 0.0  # column may not exist yet on an un-migrated DB
+
+        if len(rows) < min_days:
+            return 0.0
+
+        # x = how far Apple sits from the model; y = the model's actual miss
+        sxx = sxy = 0.0
+        for pred, apple, actual in rows:
+            x = apple - pred
+            y = actual - pred
+            sxx += x * x
+            sxy += x * y
+
+        if sxx < 1e-6:
+            return 0.0  # Apple never disagrees — nothing to learn from
+
+        return max(0.0, min(max_weight, sxy / sxx))
 
     def _get_live_calibration(self) -> tuple | None:
         """
@@ -337,6 +452,7 @@ def fetch_all_open_meteo(city: City) -> dict:
         "best_match": "/v1/forecast",
         "gfs": "/v1/gfs",
         "ecmwf": "/v1/ecmwf",
+        "icon": "/v1/dwd-icon",
     }
 
     all_forecasts = {}
@@ -392,6 +508,24 @@ def build_ensemble(city_key: str, target_date: str = None) -> EnsembleForecast:
             ))
     except Exception as e:
         print(f"  Warning: Open-Meteo forecast failed: {e}")
+
+    # Source 6: Apple WeatherKit (optional — needs credentials).
+    # ONLY joins the ensemble in explicit "blend" mode. In "shadow" mode it
+    # must stay out of `sources`: model_spread = max-min across sources
+    # feeds sigma (spread/4 inflation), so a shadow source would silently
+    # widen uncertainty and suppress trades before earning any trust.
+    # Shadow-mode data still accumulates via daily_learner (wk_* columns),
+    # which is what the 45-day blend gate is fitted on.
+    if weatherkit.is_enabled() and _wk_config("WEATHERKIT_MODE", "shadow") == "blend":
+        try:
+            high = weatherkit.fetch_daily_highs(city).get(target_date)
+            if high is not None:
+                ensemble.sources.append(ForecastSource(
+                    source="AppleWeatherKit",
+                    high_f=high,
+                ))
+        except Exception as e:
+            print(f"  Warning: WeatherKit forecast failed: {e}")
 
     # Compute ensemble statistics
     ensemble.compute()

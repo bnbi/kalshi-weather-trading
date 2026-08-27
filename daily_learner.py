@@ -29,6 +29,7 @@ from weather import CITIES
 from historical_data import init_historical_tables, fetch_actual_temps
 from train_model import train_and_evaluate, get_model_path
 from weather_ensemble import fetch_open_meteo_forecast
+import weatherkit
 
 BOT_DIR = Path(__file__).parent
 DB_PATH = BOT_DIR / "kalshi_data.db"
@@ -58,6 +59,17 @@ def init_prediction_log(conn: sqlite3.Connection) -> None:
     """)
     conn.commit()
 
+    # Extra forecast sources added after the table was first created.
+    # ICON was previously only backfilled into historical_forecasts, so
+    # live-collected rows lost it; both are now logged here every run.
+    for col in ["icon_forecast_f", "icon_error",
+                "wk_forecast_f", "wk_error"]:
+        try:
+            conn.execute(f"ALTER TABLE daily_predictions ADD COLUMN {col} REAL")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
 
 # ── Step 1: Record today's forecasts ───────────────────────────────
 
@@ -85,7 +97,7 @@ def record_forecasts(conn: sqlite3.Connection, city_key: str,
     print(f"  [{city_key}] Recording forecasts for {target_date}...")
 
     # Fetch from each model
-    gfs = ecmwf = blend = None
+    gfs = ecmwf = blend = icon = wk = None
 
     try:
         forecasts = fetch_open_meteo_forecast(city, "/v1/gfs", "gfs")
@@ -109,6 +121,23 @@ def record_forecasts(conn: sqlite3.Connection, city_key: str,
     except Exception as e:
         print(f"    Blend fetch failed: {e}")
 
+    time.sleep(0.3)
+
+    try:
+        forecasts = fetch_open_meteo_forecast(city, "/v1/dwd-icon", "icon")
+        icon = forecasts.get(target_date)
+    except Exception as e:
+        print(f"    ICON fetch failed: {e}")
+
+    # Apple WeatherKit — independent of the NWP models above, so it is the
+    # most informative addition to the ensemble. Silently skipped when
+    # credentials are absent.
+    if weatherkit.is_enabled():
+        try:
+            wk = weatherkit.fetch_daily_highs(city).get(target_date)
+        except Exception as e:
+            print(f"    WeatherKit fetch failed: {e}")
+
     if gfs is None and ecmwf is None and blend is None:
         print(f"    No forecasts available — skipping")
         return
@@ -121,7 +150,7 @@ def record_forecasts(conn: sqlite3.Connection, city_key: str,
             model_path = str(BOT_DIR / get_model_path(city_key))
             dt = datetime.strptime(target_date, "%Y-%m-%d")
             result = predict_with_trained_model(
-                gfs=gfs, ecmwf=ecmwf, blend=blend,
+                gfs=gfs, ecmwf=ecmwf, blend=blend, icon=icon,
                 month=dt.month,
                 day_of_year=dt.timetuple().tm_yday,
                 model_path=model_path,
@@ -134,12 +163,14 @@ def record_forecasts(conn: sqlite3.Connection, city_key: str,
     conn.execute("""
         INSERT OR IGNORE INTO daily_predictions (
             date, city, gfs_forecast_f, ecmwf_forecast_f, blend_forecast_f,
-            model_prediction_f, recorded_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (target_date, city_key, gfs, ecmwf, blend, model_pred, now))
+            icon_forecast_f, wk_forecast_f, model_prediction_f, recorded_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (target_date, city_key, gfs, ecmwf, blend, icon, wk, model_pred, now))
     conn.commit()
 
-    forecasts_str = f"GFS={gfs}, ECMWF={ecmwf}, Blend={blend}"
+    forecasts_str = f"GFS={gfs}, ECMWF={ecmwf}, Blend={blend}, ICON={icon}"
+    if wk is not None:
+        forecasts_str += f", Apple={wk}"
     model_str = f", Model={model_pred}" if model_pred else ""
     print(f"    Recorded: {forecasts_str}{model_str}")
 
@@ -160,7 +191,8 @@ def verify_yesterday(conn: sqlite3.Connection, city_key: str,
     # Check if we have a prediction to verify
     row = conn.execute("""
         SELECT gfs_forecast_f, ecmwf_forecast_f, blend_forecast_f,
-               model_prediction_f, actual_high_f
+               model_prediction_f, actual_high_f,
+               icon_forecast_f, wk_forecast_f
         FROM daily_predictions
         WHERE date = ? AND city = ?
     """, (check_date, city_key)).fetchone()
@@ -174,15 +206,30 @@ def verify_yesterday(conn: sqlite3.Connection, city_key: str,
         return {"actual": row[4], "already_done": True}
 
     gfs, ecmwf, blend, model_pred = row[0], row[1], row[2], row[3]
+    icon, wk = row[5], row[6]
 
-    # Fetch actual temperature
+    # Fetch actual temperature — settlement-station truth first (this is
+    # the number Kalshi settles on), ERA5 reanalysis only as a fallback.
     print(f"  [{city_key}] Fetching actual high for {check_date}...")
+    actual = None
     try:
-        actuals = fetch_actual_temps(city, check_date, check_date)
-        actual = actuals.get(check_date)
+        from station_obs import fetch_station_daily_high
+        actual = fetch_station_daily_high(city_key, check_date)
+        if actual is not None:
+            print(f"    (official station reading)")
     except Exception as e:
-        print(f"    Could not fetch actual temp: {e}")
-        return None
+        print(f"    Station obs failed: {e}")
+
+    if actual is None:
+        try:
+            actuals = fetch_actual_temps(city, check_date, check_date)
+            actual = actuals.get(check_date)
+            if actual is not None:
+                print(f"    WARNING: using ERA5 fallback — may differ "
+                      f"from settlement station")
+        except Exception as e:
+            print(f"    Could not fetch actual temp: {e}")
+            return None
 
     if actual is None:
         print(f"    Actual temp not yet available for {check_date}")
@@ -193,6 +240,8 @@ def verify_yesterday(conn: sqlite3.Connection, city_key: str,
     ecmwf_err = (ecmwf - actual) if ecmwf is not None else None
     blend_err = (blend - actual) if blend is not None else None
     model_err = (model_pred - actual) if model_pred is not None else None
+    icon_err = (icon - actual) if icon is not None else None
+    wk_err = (wk - actual) if wk is not None else None
 
     now = datetime.now(timezone.utc).isoformat()
     conn.execute("""
@@ -202,10 +251,12 @@ def verify_yesterday(conn: sqlite3.Connection, city_key: str,
             gfs_error = ?,
             ecmwf_error = ?,
             blend_error = ?,
+            icon_error = ?,
+            wk_error = ?,
             verified_at = ?
         WHERE date = ? AND city = ?
-    """, (actual, model_err, gfs_err, ecmwf_err, blend_err, now,
-          check_date, city_key))
+    """, (actual, model_err, gfs_err, ecmwf_err, blend_err, icon_err, wk_err,
+          now, check_date, city_key))
     conn.commit()
 
     print(f"    Actual: {actual}°F")
@@ -215,6 +266,10 @@ def verify_yesterday(conn: sqlite3.Connection, city_key: str,
         print(f"    ECMWF:  {ecmwf}°F (error: {ecmwf_err:+.1f}°F)")
     if blend is not None:
         print(f"    Blend:  {blend}°F (error: {blend_err:+.1f}°F)")
+    if icon is not None:
+        print(f"    ICON:   {icon}°F (error: {icon_err:+.1f}°F)")
+    if wk is not None:
+        print(f"    Apple:  {wk}°F (error: {wk_err:+.1f}°F)")
     if model_pred is not None:
         print(f"    Model:  {model_pred}°F (error: {model_err:+.1f}°F)")
 
@@ -241,7 +296,8 @@ def add_to_training_data(conn: sqlite3.Connection, city_key: str,
 
     # Get the verified prediction
     row = conn.execute("""
-        SELECT gfs_forecast_f, ecmwf_forecast_f, blend_forecast_f, actual_high_f
+        SELECT gfs_forecast_f, ecmwf_forecast_f, blend_forecast_f, actual_high_f,
+               icon_forecast_f, wk_forecast_f
         FROM daily_predictions
         WHERE date = ? AND city = ? AND actual_high_f IS NOT NULL
     """, (check_date, city_key)).fetchone()
@@ -249,7 +305,7 @@ def add_to_training_data(conn: sqlite3.Connection, city_key: str,
     if row is None:
         return False
 
-    gfs, ecmwf, blend, actual = row
+    gfs, ecmwf, blend, actual, icon, wk = row
 
     # Check if already in historical_forecasts
     existing = conn.execute(
@@ -286,8 +342,9 @@ def add_to_training_data(conn: sqlite3.Connection, city_key: str,
             gfs_forecast_f, ecmwf_forecast_f, blend_forecast_f,
             gfs_error, ecmwf_error, blend_error,
             month, day_of_year, model_spread,
-            wind_speed_max, humidity_mean, cloud_cover_mean
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            wind_speed_max, humidity_mean, cloud_cover_mean,
+            icon_forecast_f, icon_error, wk_forecast_f, wk_error
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         check_date, city_key, actual,
         gfs, ecmwf, blend,
@@ -298,6 +355,8 @@ def add_to_training_data(conn: sqlite3.Connection, city_key: str,
         dt.timetuple().tm_yday,
         spread,
         wind, humidity, cloud,
+        icon, (icon - actual) if icon is not None else None,
+        wk, (wk - actual) if wk is not None else None,
     ))
     conn.commit()
 
@@ -402,7 +461,10 @@ def print_learning_stats(conn: sqlite3.Connection) -> None:
                    AVG(ABS(gfs_error)),
                    AVG(ABS(ecmwf_error)),
                    AVG(ABS(blend_error)),
-                   MIN(date), MAX(date)
+                   MIN(date), MAX(date),
+                   AVG(ABS(icon_error)),
+                   AVG(ABS(wk_error)),
+                   SUM(CASE WHEN wk_error IS NOT NULL THEN 1 ELSE 0 END)
             FROM daily_predictions
             WHERE city = ?
         """, (city_key,)).fetchone()
@@ -433,6 +495,11 @@ def print_learning_stats(conn: sqlite3.Connection) -> None:
                 print(f"    ECMWF:         {ecmwf_mae:.2f}°F")
             if blend_mae is not None:
                 print(f"    Blend:         {blend_mae:.2f}°F")
+            if row[8] is not None:
+                print(f"    ICON:          {row[8]:.2f}°F")
+            if row[9] is not None:
+                print(f"    Apple:         {row[9]:.2f}°F  ({row[10]} days)")
+                _print_weatherkit_status(city_key)
 
     # Training data growth
     print(f"\n  {'─' * 40}")
@@ -443,6 +510,46 @@ def print_learning_stats(conn: sqlite3.Connection) -> None:
             (city_key,)
         ).fetchone()[0]
         print(f"    {city_key}: {count} days")
+
+
+def _print_weatherkit_status(city_key: str) -> None:
+    """Show whether Apple's forecast has earned a blend weight yet."""
+    from weather_ensemble import EnsembleForecast, _wk_config
+    from weather import CITIES as _CITIES
+
+    # Fair comparison: Apple vs the model on the SAME verified days only.
+    # Per-column AVG(ABS(...)) elsewhere averages each source over its own
+    # coverage window — the model's window includes months Apple wasn't
+    # collected, so those numbers are NOT comparable across seasons.
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        n, wk_mae, model_mae = conn.execute("""
+            SELECT COUNT(*), AVG(ABS(wk_error)), AVG(ABS(model_error))
+            FROM daily_predictions
+            WHERE city = ? AND wk_error IS NOT NULL
+              AND model_error IS NOT NULL
+        """, (city_key,)).fetchone()
+        conn.close()
+        if n:
+            print(f"    → Same-day comparison ({n} day(s)): "
+                  f"Apple MAE {wk_mae:.2f}°F vs model {model_mae:.2f}°F")
+    except Exception:
+        pass
+
+    ens = EnsembleForecast(city=_CITIES[city_key].name, date="")
+    weight = ens._get_weatherkit_weight()
+    mode = _wk_config("WEATHERKIT_MODE", "shadow")
+    min_days = _wk_config("WEATHERKIT_MIN_VERIFIED_DAYS",
+                          EnsembleForecast.WK_MIN_VERIFIED_DAYS)
+
+    if weight <= 0:
+        print(f"    → Apple blend weight: 0.00 "
+              f"(needs {min_days} verified days, or Apple adds no signal)")
+    elif mode != "blend":
+        print(f"    → Apple blend weight: {weight:.2f} would apply, but "
+              f"WEATHERKIT_MODE is \"{mode}\" — set it to \"blend\" to use it")
+    else:
+        print(f"    → Apple blend weight: {weight:.2f} (active)")
 
 
 # ── CLI ────────────────────────────────────────────────────────────

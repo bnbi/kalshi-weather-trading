@@ -38,6 +38,20 @@ class TradeSignal:
     description: str
 
 
+def kalshi_fee_per_contract(price: float) -> float:
+    """
+    Kalshi trading fee per contract, in dollars.
+
+    Fee formula: 0.07 * price * (1 - price), rounded up to the next cent.
+    Worst case is 1.75c at a 50c price; ~1.5c at 70c. Edges must clear
+    this to be profitable, so we subtract it before comparing to min_edge.
+    """
+    import math
+    if price <= 0 or price >= 1:
+        return 0.0
+    return math.ceil(0.07 * price * (1 - price) * 100) / 100
+
+
 def get_market_prices(series_ticker: str) -> list[dict]:
     """Fetch current markets and prices for a series."""
     resp = requests.get(f"{BASE_URL}/markets", params={
@@ -129,8 +143,10 @@ def calculate_edge(predictions: list[ContractPrediction],
         # the blended edge is simply w * (model - price).
         yes_blend_prob = MODEL_WEIGHT * pred.model_probability + (1 - MODEL_WEIGHT) * yes_ask
         no_blend_prob = MODEL_WEIGHT * (1 - pred.model_probability) + (1 - MODEL_WEIGHT) * no_ask
-        yes_edge = yes_blend_prob - yes_ask
-        no_edge = no_blend_prob - no_ask
+        # Edges are net of Kalshi's trading fee — a thin gross edge that
+        # doesn't cover the fee is a losing trade, not a marginal one.
+        yes_edge = yes_blend_prob - yes_ask - kalshi_fee_per_contract(yes_ask)
+        no_edge = no_blend_prob - no_ask - kalshi_fee_per_contract(no_ask)
 
         # Distrust filter: SKIP (don't cap) implausible disagreements
         yes_credible = raw_yes <= MAX_CREDIBLE_EDGE

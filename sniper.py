@@ -54,7 +54,9 @@ DB_PATH = BOT_DIR / "kalshi_data.db"
 KILL_SWITCH_FILE = BOT_DIR / "KILL_SWITCH"
 
 # Settlement stations (must match what Kalshi settles on)
-STATIONS = {"chicago": "KMDW", "nyc": "KNYC", "miami": "KMIA"}
+STATIONS = {"chicago": "KMDW", "nyc": "KNYC", "miami": "KMIA",
+            "denver": "KDEN", "austin": "KAUS", "la": "KLAX",
+            "philly": "KPHL"}
 
 # ── Strategy parameters ─────────────────────────────────────────────
 MIN_LOCAL_HOUR = 13     # don't snipe before 1pm local — high not locked yet
@@ -62,7 +64,7 @@ MAX_LOCAL_HOUR = 21     # markets near close; settlement imminent
 MIN_PROB = 0.80         # only bet sides we believe ≥80% — certainty is the edge
 MIN_EDGE = 0.10         # require 10¢ of mispricing (thin books, real spread cost)
 MAX_TRADES_PER_CITY = 2
-DEFAULT_BUDGET = 6.0    # max $ per run across all cities
+DEFAULT_BUDGET = None   # None = MAX_RUN_EXPOSURE_PCT of bankroll (config)
 MC_SAMPLES = 20000
 
 # Validation gate for --auto mode
@@ -73,7 +75,24 @@ VALIDATION_MAX_CALIB_GAP = 0.15   # claimed prob may exceed realized win rate by
 # the validation gate only counts signals scored by the CURRENT model. Signals
 # logged before this tag existed have model_version = NULL (the old, badly
 # overconfident max(obs+spike, forecast) model) and are excluded from the gate.
-MODEL_VERSION = "fh-bracket-only-v3"
+MODEL_VERSION = "fh-passthrough-v4"
+
+# ── v4 signal classes (from 50 verified signals through 2026-08-02) ──
+# Verified history splits bracket-NO bets into two shapes:
+#   PASS-THROUGH: obs still below the bracket, remaining forecast well above
+#     it — the temp must climb THROUGH the bracket; NO wins unless it stalls
+#     inside. Afternoon signals (≤9h to close) with ≥2°F forecast overshoot:
+#     10W/0L, +238% ROI. The SAME shape fired at 10h (1pm, still forecast-
+#     dependent): repeatedly lost. Morning pass-throughs are re-forecasting
+#     the day — the game the day-ahead results proved we lose.
+#   ALREADY-PASSED: obs feed above the bracket top. Sounds free, but the
+#     official CLI sensor can read ~0.5-1°F below our obs feed (a 89.6°F obs
+#     settled 89°F and lost). Require a 1.5°F margin so feed-vs-official
+#     disagreement cannot flip settlement.
+V4_MAX_HOURS_REMAINING = 9     # no pass-through signals before ~2pm local
+V4_MIN_OVERSHOOT_F = 2.0       # rem forecast must clear bracket top by this
+V4_OBS_PASSED_MARGIN_F = 1.5   # obs margin over bracket top for "already passed"
+V4_PROB_CAP = 0.93             # never claim more than 93% — hubris tax
 
 
 # ── Database ────────────────────────────────────────────────────────
@@ -245,6 +264,31 @@ def final_high_samples(obs_max: float, rem_max: float | None,
     return np.maximum(obs_max, samples)   # physical floor: high >= observed max
 
 
+def v4_signal_class(obs_max: float, rem_max: float | None,
+                    hours_remaining: float,
+                    bracket_low: float, bracket_high: float) -> str | None:
+    """
+    Classify a potential bracket-NO bet under the v4 rules.
+
+    Returns 'passed', 'pass-through', or None (no trade). See the v4
+    parameter block for the evidence behind each rule.
+    """
+    # Already passed: obs comfortably above the bracket top, with margin
+    # for the official sensor reading lower than our obs feed.
+    if obs_max >= bracket_high + V4_OBS_PASSED_MARGIN_F:
+        return "passed"
+
+    # Pass-through: temp must climb through the bracket, afternoon only,
+    # with the remaining forecast well clear of the bracket top.
+    if (rem_max is not None
+            and obs_max < bracket_low
+            and rem_max >= bracket_high + V4_MIN_OVERSHOOT_F
+            and hours_remaining <= V4_MAX_HOURS_REMAINING):
+        return "pass-through"
+
+    return None
+
+
 def contract_prob_yes(samples: np.ndarray, info: dict, title: str) -> float | None:
     """P(contract settles YES) from final-high samples. Settlement is integer °F."""
     settled = np.round(samples)
@@ -295,31 +339,43 @@ def find_sniper_signals(city_key: str, local_date: str,
         if kalshi_date not in ticker:
             continue
         info = parse_contract_ticker(ticker)
-        # Skip threshold contracts — 1W/14L (7% win rate) in validation.
-        # The Monte Carlo model is badly miscalibrated on thresholds; bracket
-        # NO bets are 22W/1L (96%). Only trade brackets until threshold logic
-        # is diagnosed and fixed.
-        if info.get("type") == "threshold":
+        # v4: bracket NO bets only. Thresholds went 1W/14L (7%) in
+        # validation; YES bracket bets mean picking the exact 1°F stop —
+        # the same bet type the day-ahead post-mortem showed is -80% ROI.
+        if info.get("type") != "bracket":
             continue
+
+        # v4 structural gate: the shape of the situation must qualify,
+        # regardless of what the Monte Carlo probability claims.
+        sig_class = v4_signal_class(
+            obs_max=obs["obs_max_f"],
+            rem_max=rem["rem_max_f"],
+            hours_remaining=rem["hours_remaining"],
+            bracket_low=info["bracket_low"],
+            bracket_high=info["bracket_high"],
+        )
+        if sig_class is None:
+            continue
+
         p_yes = contract_prob_yes(samples, info, m.get("title", ""))
         if p_yes is None:
             continue
 
-        yes_ask = parse_price(m.get("yes_ask_dollars", m.get("yes_ask")))
         no_ask = parse_price(m.get("no_ask_dollars", m.get("no_ask")))
+        if no_ask is None or no_ask <= 0.02 or no_ask >= 0.97:
+            continue
 
-        for side, p_side, ask in (("yes", p_yes, yes_ask), ("no", 1 - p_yes, no_ask)):
-            if ask is None or ask <= 0.02 or ask >= 0.97:
-                continue
-            edge = p_side - ask
-            if p_side >= MIN_PROB and edge >= MIN_EDGE:
-                signals.append(TradeSignal(
-                    ticker=ticker, side=side, action="buy",
-                    model_prob=p_side, market_price=ask,
-                    edge=edge, expected_value=edge,
-                    description=f"SNIPE {side.upper()} @ ${ask:.2f} | "
-                                f"P={p_side:.1%} | obs_max={obs['obs_max_f']:.1f}°F",
-                ))
+        # Cap claimed probability — v3's 97-99% claims won 36% of the time.
+        p_no = min(V4_PROB_CAP, 1 - p_yes)
+        edge = p_no - no_ask
+        if p_no >= MIN_PROB and edge >= MIN_EDGE:
+            signals.append(TradeSignal(
+                ticker=ticker, side="no", action="buy",
+                model_prob=p_no, market_price=no_ask,
+                edge=edge, expected_value=edge,
+                description=f"SNIPE NO @ ${no_ask:.2f} [{sig_class}] | "
+                            f"P={p_no:.1%} | obs_max={obs['obs_max_f']:.1f}°F",
+            ))
 
     signals.sort(key=lambda s: s.edge, reverse=True)
     return signals[:MAX_TRADES_PER_CITY], ctx
@@ -480,6 +536,14 @@ def run(cities: list[str] = None, mode: str = "dry", budget: float = DEFAULT_BUD
     # ── Live execution path ─────────────────────────────────────────
     client = create_client_from_config()
     balance = client.get_balance().get("balance", 0) / 100
+    # Percentage-based budget, same scheme as the day-ahead trader;
+    # an explicit --budget still acts as a hard dollar ceiling.
+    try:
+        from config import MAX_RUN_EXPOSURE_PCT as _pct
+    except ImportError:
+        _pct = 0.25
+    pct_budget = balance * _pct
+    budget = min(budget, pct_budget) if budget is not None else pct_budget
     budget = min(budget, balance)
     if budget <= 0.5:
         print("  Insufficient balance.")
@@ -492,12 +556,13 @@ def run(cities: list[str] = None, mode: str = "dry", budget: float = DEFAULT_BUD
         print(f"  Skipping existing positions: {list(existing.keys())}")
         signals_only = [s for s in signals_only if s.ticker not in existing]
 
+    # Percentage-based sizing, same scheme as the day-ahead trader
     try:
         import config
-        max_position = getattr(config, "MAX_POSITION_SIZE_CENTS", 200) / 100
-        kelly = getattr(config, "KELLY_FRACTION", 0.15)
+        max_position = balance * getattr(config, "MAX_POSITION_PCT", 0.08)
+        kelly = getattr(config, "KELLY_FRACTION", 0.25)
     except ImportError:
-        max_position, kelly = 2.0, 0.15
+        max_position, kelly = balance * 0.08, 0.25
 
     orders = size_orders(signals_only, bankroll=balance, kelly_fraction=kelly,
                          max_position_dollars=max_position,
@@ -568,7 +633,9 @@ if __name__ == "__main__":
     p_run.add_argument("--live", action="store_true", help="Force live trading")
     p_run.add_argument("--auto", action="store_true",
                        help="Live only if validation gate has passed")
-    p_run.add_argument("--budget", type=float, default=DEFAULT_BUDGET)
+    p_run.add_argument("--budget", type=float, default=None,
+                       help="Optional hard dollar ceiling (default: "
+                            "MAX_RUN_EXPOSURE_PCT of bankroll)")
 
     sub.add_parser("verify", help="Score past signals")
     sub.add_parser("report", help="Show validation status")

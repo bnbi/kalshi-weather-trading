@@ -94,18 +94,33 @@ def api_trades():
     return jsonify(trades)
 
 
+# Chart default: show the current model era only. 2026-08-18 is when the
+# fully overhauled system went live (station-truth training targets,
+# fee-adjusted edges, per-day sigma, 7 cities, CreateOrder V2). Trades
+# before that were made by materially different systems, and mixing
+# regimes muddies the monitoring signal. The full history stays available
+# via ?since=all (UI toggle) and in pnl_tracker / RESEARCH.md — this
+# filters the chart, not the record.
+MODEL_ERA_START = "2026-08-18"
+
+
 @app.route("/api/daily_pnl")
 def api_daily_pnl():
+    since = request.args.get("since", MODEL_ERA_START)
+    where, params = "", ()
+    if since != "all":
+        where, params = "WHERE DATE(timestamp) >= ?", (since,)
+
     conn = get_db()
-    rows = conn.execute("""
+    rows = conn.execute(f"""
         SELECT DATE(timestamp) as day,
                SUM(cost_dollars) as invested,
                SUM(CASE WHEN settled = 1 THEN profit_dollars ELSE 0 END) as pnl,
                COUNT(*) as trades,
                SUM(CASE WHEN settled = 1 AND profit_dollars > 0 THEN 1 ELSE 0 END) as wins,
                SUM(CASE WHEN settled = 1 THEN 1 ELSE 0 END) as settled
-        FROM trades GROUP BY DATE(timestamp) ORDER BY day
-    """).fetchall()
+        FROM trades {where} GROUP BY DATE(timestamp) ORDER BY day
+    """, params).fetchall()
     conn.close()
 
     daily = []

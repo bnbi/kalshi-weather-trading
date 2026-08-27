@@ -351,16 +351,27 @@ def print_daily(conn: sqlite3.Connection) -> None:
               f"{win_rate:<7} ${pnl:<+8.2f} ${cumulative:+.2f}")
 
 
-def print_calibration(conn: sqlite3.Connection) -> None:
+def print_calibration(conn: sqlite3.Connection, since: str = None) -> None:
     """
     Check model calibration: do predicted probabilities match actual outcomes?
     Groups trades into probability buckets and compares predicted vs actual win rate.
+
+    since: only score trades on/after this date (e.g. '2026-08-18' for the
+    current model era). Default: all settled trades — which mixes model
+    regimes, so pass --since when judging the CURRENT model.
     """
-    rows = conn.execute("""
+    where = "WHERE settled = 1 AND model_prob IS NOT NULL"
+    params = ()
+    if since:
+        where += " AND timestamp >= ?"
+        params = (since,)
+        print(f"\n  (scoring trades since {since} only)")
+
+    rows = conn.execute(f"""
         SELECT model_prob, profit_dollars, price_cents / 100.0
         FROM trades
-        WHERE settled = 1 AND model_prob IS NOT NULL
-    """).fetchall()
+        {where}
+    """, params).fetchall()
 
     if len(rows) < 5:
         print("\n  Not enough settled trades for calibration analysis (need ≥5).")
@@ -481,6 +492,9 @@ if __name__ == "__main__":
     parser.add_argument("command", nargs="?", default="summary",
                         choices=["summary", "trades", "update", "daily", "calibration"],
                         help="What to show (default: summary)")
+    parser.add_argument("--since", type=str, default=None,
+                        help="Only score trades on/after this date "
+                             "(e.g. 2026-08-18 = current model era)")
     parser.add_argument("--limit", type=int, default=20,
                         help="Max trades to show (for 'trades' command)")
     args = parser.parse_args()
@@ -505,6 +519,6 @@ if __name__ == "__main__":
         print_daily(conn)
 
     elif args.command == "calibration":
-        print_calibration(conn)
+        print_calibration(conn, since=args.since)
 
     conn.close()

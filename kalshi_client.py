@@ -56,28 +56,64 @@ class KalshiClient:
         }
 
     def _request(self, method: str, path: str, params: dict = None,
-                 json_body: dict = None, auth: bool = False) -> dict:
-        """Make an API request, optionally with authentication."""
+                 json_body: dict = None, auth: bool = False,
+                 max_retries: int = 3) -> dict:
+        """
+        Make an API request, optionally with authentication.
+
+        Retries transient failures (401, 5xx, timeouts, connection errors)
+        with a fresh signature timestamp on each attempt. Intermittent 401s
+        happen when the local clock is momentarily skewed (e.g. right after
+        the machine wakes from sleep), so re-signing usually fixes them.
+
+        POST/DELETE requests are NOT retried after a timeout/connection
+        error, since the order may have gone through — only auth (401)
+        failures are retried for those, which are safe (nothing executed).
+        """
         url = f"{self.base_url}{path}"
+        is_mutation = method.upper() in ("POST", "DELETE")
 
-        # Sign the FULL path (e.g. /trade-api/v2/portfolio/balance)
-        # not just the relative path (/portfolio/balance)
-        if auth:
-            full_path = urlparse(url).path
-            headers = self._sign_request(method, full_path)
-        else:
-            headers = {}
+        last_error = None
+        for attempt in range(max_retries):
+            if attempt > 0:
+                time.sleep(2 ** attempt)  # 2s, 4s backoff
 
-        response = self.session.request(
-            method=method,
-            url=url,
-            headers=headers,
-            params=params,
-            json=json_body,
-            timeout=15,
-        )
-        response.raise_for_status()
-        return response.json()
+            # Sign the FULL path (e.g. /trade-api/v2/portfolio/balance)
+            # not just the relative path (/portfolio/balance).
+            # Re-sign every attempt so the timestamp is fresh.
+            if auth:
+                full_path = urlparse(url).path
+                headers = self._sign_request(method, full_path)
+            else:
+                headers = {}
+
+            try:
+                response = self.session.request(
+                    method=method,
+                    url=url,
+                    headers=headers,
+                    params=params,
+                    json=json_body,
+                    timeout=15,
+                )
+            except (requests.Timeout, requests.ConnectionError) as e:
+                last_error = e
+                if is_mutation:
+                    raise  # order may have been placed — don't double-submit
+                continue
+
+            if response.status_code == 401 or response.status_code >= 500:
+                last_error = requests.HTTPError(
+                    f"{response.status_code} {response.reason} for url: {url}",
+                    response=response,
+                )
+                # 401/5xx before execution — safe to retry even mutations
+                continue
+
+            response.raise_for_status()
+            return response.json()
+
+        raise last_error
 
     # ── Public endpoints (no auth required) ─────────────────────────
 
@@ -149,35 +185,59 @@ class KalshiClient:
                      yes_price: int = None, no_price: int = None,
                      client_order_id: str = None) -> dict:
         """
-        Place an order.
+        Place a limit order via CreateOrder V2.
 
-        ticker: market ticker (e.g. 'KXHIGHNY-25JUN15-T80')
-        side: 'yes' or 'no'
-        action: 'buy' or 'sell'
-        count: number of contracts
-        type: 'limit' or 'market'
-        yes_price: price in cents (1-99) if buying/selling yes
-        no_price: price in cents (1-99) if buying/selling no
+        Kalshi removed the legacy POST /portfolio/orders endpoint (410 Gone
+        since late June 2026). The V2 endpoint quotes everything from the
+        YES side of the single book:
+            buy YES at p          -> side='bid', price=p
+            buy NO  at p          -> side='ask', price=1-p
+              (selling YES you don't hold is how a NO position is opened;
+               economically identical to buying NO at 1-price)
+        Prices and counts are fixed-point strings.
+
+        The (ticker, side yes/no, action, count, *_price cents) signature is
+        kept so existing callers don't change.
         """
+        if action != "buy":
+            raise ValueError(f"only 'buy' orders supported, got {action!r}")
+
+        if side == "yes":
+            if yes_price is None:
+                raise ValueError("yes_price required for side='yes'")
+            book_side = "bid"
+            price_dollars = yes_price / 100
+        elif side == "no":
+            if no_price is None:
+                raise ValueError("no_price required for side='no'")
+            book_side = "ask"
+            price_dollars = (100 - no_price) / 100
+        else:
+            raise ValueError(f"side must be 'yes' or 'no', got {side!r}")
+
         body = {
             "ticker": ticker,
-            "side": side,
-            "action": action,
-            "count": count,
-            "type": type,
+            "side": book_side,
+            "count": str(count),
+            "price": f"{price_dollars:.2f}",
+            "time_in_force": "good_till_canceled",
+            "self_trade_prevention_type": "taker_at_cross",
         }
-        if yes_price is not None:
-            body["yes_price"] = yes_price
-        if no_price is not None:
-            body["no_price"] = no_price
         if client_order_id:
             body["client_order_id"] = client_order_id
 
-        return self._request("POST", "/portfolio/orders", json_body=body, auth=True)
+        response = self._request("POST", "/portfolio/events/orders",
+                                 json_body=body, auth=True)
+        # V2 returns order fields at the top level; legacy nested them under
+        # "order". Normalize so existing callers keep working.
+        if "order" not in response:
+            response = {"order": response, **response}
+        return response
 
     def cancel_order(self, order_id: str) -> dict:
-        """Cancel an open order."""
-        return self._request("DELETE", f"/portfolio/orders/{order_id}", auth=True)
+        """Cancel an open order (V2 endpoint)."""
+        return self._request("DELETE", f"/portfolio/events/orders/{order_id}",
+                             auth=True)
 
     def get_orders(self, ticker: str = None, status: str = None,
                    limit: int = 100) -> dict:

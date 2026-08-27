@@ -35,6 +35,16 @@ KILL_SWITCH_FILE = BOT_DIR / "KILL_SWITCH"
 LOG_DIR = BOT_DIR / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
+# All configured cities (import kept lazy-safe: weather has no side effects)
+from weather import CITIES as _CITIES
+CITIES_ALL = list(_CITIES.keys())
+
+
+def tradeable_cities() -> list:
+    """Cities that have a trained forecast model on disk."""
+    return [c for c in CITIES_ALL
+            if (BOT_DIR / f"forecast_model_{c}.pkl").exists()]
+
 
 # ── Logging setup ──────────────────────────────────────────────────
 
@@ -123,7 +133,7 @@ def print_status() -> None:
 
 # ── Trading run ────────────────────────────────────────────────────
 
-def run_once(cities: list[str] = None, max_spend: float = 10.0,
+def run_once(cities: list[str] = None, max_spend: float = None,
              min_edge: float = 0.05):
     """
     Execute one trading run across specified cities.
@@ -142,7 +152,18 @@ def run_once(cities: list[str] = None, max_spend: float = 10.0,
         return
 
     if cities is None:
-        cities = ["chicago", "nyc", "miami"]
+        # Trade every configured city that has a trained model. New cities
+        # enter the rotation automatically once backfill_history.py has
+        # bootstrapped their data and trained a model — never before, so an
+        # untrained naive-average forecast can never place real orders.
+        # (NYC re-enabled 2026-08-02: retrained on station truth it scores
+        # 1.10°F MAE vs 1.31 baseline — the earlier "no edge" verdict was
+        # an artifact of grading against ERA5.)
+        cities = tradeable_cities()
+        skipped = [c for c in CITIES_ALL if c not in cities]
+        if skipped:
+            logger.info(f"  Cities awaiting trained models (run "
+                        f"backfill_history.py): {skipped}")
 
     # Import here so kill switch check happens before any API calls
     from trader import run_trading_pipeline
@@ -172,11 +193,18 @@ def run_once(cities: list[str] = None, max_spend: float = 10.0,
         available = balance.get("balance", 0) / 100  # API returns cents
         logger.info(f"  Account balance: ${available:.2f}")
 
-        # Never try to spend more than available balance across ALL cities
-        total_budget = min(max_spend, available)
-        if total_budget < max_spend:
-            logger.warning(f"  Budget capped to available balance: "
-                           f"${max_spend:.2f} → ${total_budget:.2f}")
+        # Budget is a percentage of the live bankroll (scale-invariant);
+        # an explicit --max-spend still overrides it as a hard ceiling.
+        try:
+            from config import MAX_RUN_EXPOSURE_PCT
+        except ImportError:
+            MAX_RUN_EXPOSURE_PCT = 0.25
+        total_budget = available * MAX_RUN_EXPOSURE_PCT
+        if max_spend is not None:
+            total_budget = min(total_budget, max_spend)
+        total_budget = min(total_budget, available)
+        logger.info(f"  Run budget: ${total_budget:.2f} "
+                    f"({MAX_RUN_EXPOSURE_PCT:.0%} of bankroll)")
 
         # Divide budget across cities so no single city hogs all funds
         per_city_budget = total_budget / len(cities)
@@ -208,7 +236,10 @@ def run_once(cities: list[str] = None, max_spend: float = 10.0,
         try:
             balance = client.get_balance()
             available = balance.get("balance", 0) / 100
-            total_budget = min(max_spend, available)
+            total_budget = available * MAX_RUN_EXPOSURE_PCT
+            if max_spend is not None:
+                total_budget = min(total_budget, max_spend)
+            total_budget = min(total_budget, available)
             per_city_budget = total_budget / len(cities)
             logger.info(f"  Account balance: ${available:.2f}")
         except Exception as e:
@@ -229,15 +260,43 @@ def run_once(cities: list[str] = None, max_spend: float = 10.0,
     # (Runs AFTER trading so orders aren't delayed by ~45 min of retraining)
     logger.info("Running daily learning cycle...")
     try:
-        run_daily_learning(cities)
+        # Learn on ALL configured cities (including ones not yet trading)
+        # so every city keeps accumulating verified data.
+        run_daily_learning(CITIES_ALL)
     except Exception as e:
         logger.warning(f"  Daily learning failed: {e}")
+
+
+class _LoggerWriter:
+    """File-like object that forwards print() output line-by-line to a logger.
+
+    trader.py reports skip reasons ('No profitable trades found', 'Positions
+    too small to trade', ...) via print(). Without this, those reasons only
+    land in launchd_stdout.log and the daily trader_*.log shows silent gaps.
+    """
+
+    def __init__(self, logger: logging.Logger):
+        self.logger = logger
+        self._buf = ""
+
+    def write(self, text: str):
+        self._buf += text
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            if line.strip():
+                self.logger.info(line)
+
+    def flush(self):
+        if self._buf.strip():
+            self.logger.info(self._buf)
+        self._buf = ""
 
 
 def _execute_trading(cities: list[str], total_budget: float,
                      per_city_budget: float, min_edge: float,
                      logger: logging.Logger) -> list:
     """Execute trades across cities. Returns list of trade results."""
+    from contextlib import redirect_stdout
     from trader import run_trading_pipeline
 
     total_results = []
@@ -254,13 +313,16 @@ def _execute_trading(cities: list[str], total_budget: float,
 
         logger.info(f"\n--- Trading {city.upper()} (budget: ${city_budget:.2f}) ---")
         try:
-            results = run_trading_pipeline(
-                city_key=city,
-                dry_run=False,
-                max_spend=city_budget,
-                min_edge=min_edge,
-                tomorrow_only=True,
-            )
+            # Capture trader.py's print() output into the daily log file
+            # so skip reasons are visible there, not just in stdout.
+            with redirect_stdout(_LoggerWriter(logger)):
+                results = run_trading_pipeline(
+                    city_key=city,
+                    dry_run=False,
+                    max_spend=city_budget,
+                    min_edge=min_edge,
+                    tomorrow_only=True,
+                )
             total_results.extend(results)
 
             # Track cumulative spending
@@ -290,15 +352,16 @@ def _execute_trading(cities: list[str], total_budget: float,
 # ── Daemon mode ────────────────────────────────────────────────────
 
 def run_daemon(run_hour: int = 7, cities: list[str] = None,
-               max_spend: float = 10.0):
+               max_spend: float = None):
     """
     Run continuously, executing trades once per day at run_hour (local time).
     Useful if you don't want to set up cron.
     """
     logger = setup_logging()
     logger.info(f"Daemon started. Will trade daily at {run_hour}:00 local time.")
-    logger.info(f"Cities: {cities or ['chicago', 'nyc', 'miami']}")
-    logger.info(f"Max spend per run: ${max_spend}")
+    logger.info(f"Cities: {cities or tradeable_cities()}")
+    logger.info(f"Max spend per run: "
+                f"{'$' + format(max_spend, '.2f') if max_spend is not None else 'percentage of bankroll (config)'}")
     logger.info(f"Kill switch file: {KILL_SWITCH_FILE}")
     logger.info(f"PID: {os.getpid()}")
 
@@ -349,11 +412,13 @@ Examples:
 
     # 'run' subcommand
     run_parser = subparsers.add_parser("run", help="Execute one trading run")
-    run_parser.add_argument("--cities", nargs="+", default=["chicago", "nyc", "miami"],
-                            choices=["chicago", "nyc", "miami"],
-                            help="Cities to trade (default: all three)")
-    run_parser.add_argument("--max-spend", type=float, default=10.0,
-                            help="Max dollars to spend (default: $10)")
+    run_parser.add_argument("--cities", nargs="+", default=None,
+                            choices=CITIES_ALL,
+                            help="Cities to trade (default: every city "
+                                 "with a trained model)")
+    run_parser.add_argument("--max-spend", type=float, default=None,
+                            help="Optional hard dollar ceiling (default: "
+                                 "MAX_RUN_EXPOSURE_PCT of bankroll)")
     run_parser.add_argument("--min-edge", type=float, default=0.05,
                             help="Minimum edge to trade (default: 5%%)")
     run_parser.add_argument("--dry-run", action="store_true",
@@ -363,11 +428,13 @@ Examples:
     daemon_parser = subparsers.add_parser("daemon", help="Run continuously")
     daemon_parser.add_argument("--hour", type=int, default=7,
                                help="Hour to run each day (default: 7 = 7am)")
-    daemon_parser.add_argument("--cities", nargs="+", default=["chicago", "nyc", "miami"],
-                               choices=["chicago", "nyc", "miami"],
-                               help="Cities to trade (default: all three)")
-    daemon_parser.add_argument("--max-spend", type=float, default=10.0,
-                               help="Max dollars per run")
+    daemon_parser.add_argument("--cities", nargs="+", default=None,
+                               choices=CITIES_ALL,
+                               help="Cities to trade (default: every city "
+                                    "with a trained model)")
+    daemon_parser.add_argument("--max-spend", type=float, default=None,
+                               help="Optional hard dollar ceiling (default: "
+                                    "MAX_RUN_EXPOSURE_PCT of bankroll)")
 
     args = parser.parse_args()
 
@@ -389,10 +456,18 @@ Examples:
         if args.dry_run:
             # Dry run — same budget split as live so numbers are realistic
             from trader import run_trading_pipeline
-            per_city = args.max_spend / len(args.cities)
+            dry_cities = args.cities or tradeable_cities()
+            # Dry run simulates a $100 bankroll (see trader.py), so the
+            # default budget mirrors the live percentage sizing.
+            try:
+                from config import MAX_RUN_EXPOSURE_PCT as _pct
+            except ImportError:
+                _pct = 0.25
+            dry_budget = args.max_spend if args.max_spend is not None else 100.0 * _pct
+            per_city = dry_budget / len(dry_cities)
             total_spent = 0.0
-            for city in args.cities:
-                remaining = args.max_spend - total_spent
+            for city in dry_cities:
+                remaining = dry_budget - total_spent
                 city_budget = min(per_city, remaining)
                 if city_budget < 0.50:
                     print(f"  Skipping {city}: only ${remaining:.2f} remaining")

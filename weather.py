@@ -52,6 +52,41 @@ CITIES = {
         lon=-80.2870,
         timezone="America/New_York",
     ),
+    "denver": City(
+        name="Denver",
+        kalshi_series="KXHIGHDEN",
+        # Kalshi settles on NWS reading at Denver Intl Airport (KDEN)
+        lat=39.8561,
+        lon=-104.6737,
+        timezone="America/Denver",
+    ),
+    "austin": City(
+        name="Austin",
+        kalshi_series="KXHIGHAUS",
+        # Kalshi settles on the NWS CLI report issued by AUS =
+        # Austin-Bergstrom Intl (KAUS) — NOT Camp Mabry, which is the
+        # other Austin climate station and reads differently.
+        # Verified against the Kalshi series API settlement_sources.
+        lat=30.1945,
+        lon=-97.6699,
+        timezone="America/Chicago",
+    ),
+    "la": City(
+        name="Los Angeles",
+        kalshi_series="KXHIGHLAX",
+        # Kalshi settles on NWS reading at LAX (KLAX)
+        lat=33.9425,
+        lon=-118.4081,
+        timezone="America/Los_Angeles",
+    ),
+    "philly": City(
+        name="Philadelphia",
+        kalshi_series="KXHIGHPHIL",
+        # Kalshi settles on NWS reading at Philadelphia Intl (KPHL)
+        lat=39.8683,
+        lon=-75.2311,
+        timezone="America/New_York",
+    ),
 }
 
 
@@ -255,6 +290,10 @@ NWS_FORECAST_BIAS = {
     "chicago": 0.0,
     "nyc": 0.0,
     "miami": 0.0,
+    "denver": 0.0,
+    "austin": 0.0,
+    "la": 0.0,
+    "philly": 0.0,
 }
 
 

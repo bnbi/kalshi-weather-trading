@@ -25,19 +25,27 @@ died in the probability layer under adverse selection. Regenerate with
 
 ## Highlights
 
-- **Probabilistic forecasting & calibration.** Per-city Lasso/Ridge correction
-  models over a GFS/ECMWF/blend ensemble (live MAE 1.36–1.54°F, beating every
-  individual source). Probability layer recalibrated continuously from live
-  verified errors; calibration tracked with reliability tables, Brier score,
-  log loss, and a skill score against the market-implied baseline.
+- **Probabilistic forecasting & calibration.** Per-city correction models over
+  a GFS/ECMWF/ICON/blend ensemble (live MAE 1.36–1.54°F, beating every
+  individual source), trained on five years of archived forecasts scored
+  against **official settlement-station observations** (NOAA GHCND) — the same
+  sensor readings Kalshi settles on, not gridded reanalysis. Uncertainty is
+  day-specific: a second regressor predicts each day's σ from spread, season,
+  and weather regime, and is automatically discarded if it fails a calibration
+  gate. The probability layer is further recalibrated continuously from live
+  verified errors and tracked with reliability tables, Brier score, log loss,
+  and a skill score against the market-implied baseline.
 - **Adverse-selection-aware trade selection.** Live data showed losses
   concentrated where model-market disagreement was largest (the winner's
   curse). Trades use shrinkage `p̂ = w·model + (1−w)·price` and a credibility
   filter that refuses trades beyond 25¢ of disagreement.
-- **Risk management.** Fractional Kelly (15%) with balance-aware caps,
-  per-trade/per-run dollar limits, orderbook depth and spread filters,
-  position de-duplication, file-based kill switch with auto-engage on
-  repeated order failures.
+- **Risk management.** Fractional Kelly (quarter-Kelly) with
+  percentage-of-bankroll ceilings per position and per run (scale-invariant —
+  no fixed dollar caps), edge thresholds net of exchange fees, a minimum-size
+  floor so a small bankroll can still express strong signals, orderbook depth
+  and spread filters, position de-duplication, file-based kill switch with
+  auto-engage on repeated order failures, and idempotent order submission
+  (client-order-id retry with fresh request signatures).
 - **Walk-forward methodology.** Time-series CV for model selection (no
   lookahead), walk-forward backtester, and a live self-learning loop that
   verifies yesterday's predictions, appends them to the training set, and
@@ -53,12 +61,13 @@ died in the probability layer under adverse selection. Regenerate with
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                  Daily Pipeline (7:00 launchd)                   │
+│                  Daily Pipeline (10:00 launchd)                  │
 │                                                                  │
 │  Weather APIs ──▶ Ensemble + ML ──▶ Shrinkage vs ──▶ Kelly      │
-│  GFS/ECMWF/NWS    correction        market prior     execution  │
-│                   + live σ/bias     + credibility    + orderbook│
-│                   recalibration       filter           filters  │
+│  GFS/ECMWF/       correction        market prior     execution  │
+│  ICON/NWS         + day-specific σ    filter           filters  │
+│                   + live σ/bias                                 │
+│                     recalibration                               │
 │                                                                  │
 ├─────────────────────────────────────────────────────────────────┤
 │              Self-Learning Loop (same run)                       │
@@ -74,7 +83,9 @@ died in the probability layer under adverse selection. Regenerate with
 | File | Purpose |
 |------|---------|
 | `weather_ensemble.py` | Multi-model ensemble + live σ/bias recalibration |
-| `train_model.py` | Feature engineering, time-series CV model selection, residual calibration |
+| `train_model.py` | Feature engineering, time-series CV model selection, per-day σ model, residual calibration |
+| `station_obs.py` | Official settlement-station observations (NOAA GHCND + NWS obs) |
+| `backfill_history.py` | One-shot bootstrap: 5y forecast archive + station truth + retrain |
 | `model.py` | Contract parsing, Normal probability model |
 | `find_edge.py` | Market-prior shrinkage, credibility filter, edge signals |
 | `orderbook.py` | Depth, spread, slippage analysis |
@@ -89,21 +100,48 @@ died in the probability layer under adverse selection. Regenerate with
 
 ## Model details
 
-**Features (16):** raw GFS/ECMWF/blend forecasts; ensemble mean and spread;
-pairwise model differences; month and sin/cos day-of-year; wind, humidity,
-cloud cover; per-model rolling 3-day error trends (shifted to avoid lookahead).
+**Ground truth:** training targets and daily verification use the official
+daily TMAX at the settlement stations themselves (Midway, Central Park, Miami
+Intl) via NOAA GHCND, with near-real-time NWS station observations as a
+fallback for recent dates. Reanalysis (ERA5) is retained only as a reference
+column — a grid average is measurably not the number the exchange settles on.
+
+**Features (19):** raw GFS/ECMWF/ICON/blend forecasts; ensemble mean and
+spread; pairwise model differences; month and sin/cos day-of-year; wind,
+humidity, cloud cover; per-model rolling 3-day error trends (shifted to avoid
+lookahead).
+
+**Apple WeatherKit (optional 5th source):** Apple post-processes its own
+model mix rather than serving raw NWP output, so its errors are the least
+correlated with GFS/ECMWF/ICON — the most useful thing to add to this
+ensemble. Apple publishes no forecast *archive*, though, so it cannot be
+backfilled the way ICON was; it accrues one day at a time from live
+collection. Until it covers half the training set it stays out of the
+feature matrix and is applied instead as a post-hoc shrinkage toward
+Apple's number, with a single weight fitted on verified live rows and
+capped at 0.35. Default mode is `shadow` (logged, widens σ via model
+spread, never moves the point forecast); flip `WEATHERKIT_MODE` to
+`blend` once `python daily_learner.py stats` reports a non-zero weight.
+Configure with the `WEATHERKIT_*` settings in `config.example.py` and
+verify with `python weatherkit.py`.
 
 **Selection:** Ridge / Lasso / ElasticNet / GBM / RF compared by 5-fold
 time-series CV MAE per city. Regularized linear models win consistently —
 the forecast features are highly collinear.
 
-**Probability layer:** `actual ~ Normal(prediction − live_bias, σ_live)`, with
-σ and bias estimated from the last 30 live verified errors (clipped bias
-±1.5°F, σ floor 1.8°F), spread-inflation for model disagreement, and
-probability clamps to prevent phantom tail edges.
+**Uncertainty:** a gradient-boosted regressor fit on out-of-fold |residuals|
+predicts a day-specific σ (clipped to 1.0–6.0°F), so a calm high-pressure day
+and a pre-frontal day are not assigned the same confidence. A calibration gate
+(observed coverage vs nominal 1σ) rejects the σ model and falls back to the
+constant CV residual σ if it tests poorly.
 
-**Trade selection:** blended probability `0.5·model + 0.5·market`, minimum 7¢
-blended edge (⇒ 14¢ raw gap), credibility filter at 25¢, bracket-YES bets
+**Probability layer:** `actual ~ Normal(prediction − live_bias, σ)`, where σ
+is the conservative max of the day-specific σ and the σ of the last 30 live
+verified errors (bias clipped ±1.5°F), plus spread-inflation for model
+disagreement and probability clamps to prevent phantom tail edges.
+
+**Trade selection:** blended probability `0.5·model + 0.5·market`, minimum
+blended edge net of exchange fees, credibility filter at 25¢, bracket-YES bets
 disallowed, price floors per side. Rationale and evidence in
 [RESEARCH.md](RESEARCH.md) §3.
 
@@ -132,9 +170,9 @@ openssl rsa -in kalshi_private_key.pem -pubout -out kalshi_public_key.pem
 # upload public key at kalshi.com/account/api, then:
 cp config.example.py config.py   # add your API key id + key path
 
-# Bootstrap training data and models
-python historical_data.py chicago --days 365   # repeat per city
-python train_all_cities.py
+# Bootstrap: 5 years of archived forecasts + official station observations,
+# then trains all per-city models (idempotent, ~15 min)
+python backfill_history.py
 
 python scheduler.py run --dry-run    # verify pipeline
 bash setup_schedule.sh               # daily 10am paper run via launchd
@@ -191,11 +229,13 @@ The system is designed to run **hands-off and money-safe by default**:
    dollars/month regardless of edge quality.
 3. **Backtest ≠ live** — the backtester's simulated market is deliberately
    naive; it validates predictive skill vs a baseline, not dollar returns.
-4. **Small samples everywhere** — 89 trades, ~30 verified days per city;
-   every conclusion carries wide confidence intervals, which is why the
-   sniper gates itself before risking capital.
+4. **Small live samples** — 92 settled trades, ~55 live-verified days per
+   city (the 5-year backfill helps the forecast model, not the live P&L
+   record); every conclusion carries wide confidence intervals, which is why
+   the sniper gates itself before risking capital.
 
 ## Stack
 
 Python · scikit-learn · scipy · numpy · pandas · SQLite · Flask · launchd ·
-Kalshi REST API (RSA-PSS) · NWS / Open-Meteo APIs
+Kalshi REST API (RSA-PSS) · NWS / Open-Meteo / NOAA NCEI / Apple
+WeatherKit (ES256 JWT) APIs

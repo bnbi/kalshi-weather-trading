@@ -45,8 +45,12 @@ def init_historical_tables(conn: sqlite3.Connection) -> None:
     """)
     conn.commit()
 
-    # Add weather feature columns if they don't exist yet
-    for col in ["wind_speed_max", "humidity_mean", "cloud_cover_mean"]:
+    # Add weather feature and extra-source columns if they don't exist yet.
+    # icon_* is backfilled by backfill_history.py; wk_* (Apple WeatherKit)
+    # accumulates live only — Apple publishes no forecast archive.
+    for col in ["wind_speed_max", "humidity_mean", "cloud_cover_mean",
+                "icon_forecast_f", "icon_error",
+                "wk_forecast_f", "wk_error"]:
         try:
             conn.execute(f"ALTER TABLE historical_forecasts ADD COLUMN {col} REAL")
             conn.commit()

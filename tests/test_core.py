@@ -134,8 +134,9 @@ def test_credibility_filter_skips_large_disagreement():
     assert all(s.ticker != pred.ticker or s.side != "no" for s in signals) or signals == []
 
 
-def test_blended_edge_is_half_raw_gap():
-    # MODEL_WEIGHT = 0.5 -> blended edge is half the raw model-market gap.
+def test_blended_edge_is_half_raw_gap_minus_fee():
+    # MODEL_WEIGHT = 0.5 -> blended edge is half the raw model-market gap,
+    # net of Kalshi's trading fee (0.07 * P * (1-P), rounded up to a cent).
     pred = _pred("KXHIGHNY-26JUN10-T70", 0.05)  # P(no)=0.95
     no_ask = 0.75
     markets = [{"ticker": pred.ticker, "yes_ask_dollars": "0.25",
@@ -144,7 +145,39 @@ def test_blended_edge_is_half_raw_gap():
     no_sigs = [s for s in signals if s.side == "no"]
     assert no_sigs, "expected a NO signal within the credibility band"
     raw_gap = 0.95 - no_ask
-    assert no_sigs[0].edge == pytest.approx(0.5 * raw_gap, abs=1e-9)
+    fee = find_edge.kalshi_fee_per_contract(no_ask)
+    assert fee == pytest.approx(0.02)  # ceil(0.07*0.75*0.25 = 1.3c) = 2c
+    assert no_sigs[0].edge == pytest.approx(0.5 * raw_gap - fee, abs=1e-9)
+
+
+def test_fee_formula():
+    # Worst case at 50c: ceil(0.07*0.25*100)=ceil(1.75)=2c
+    assert find_edge.kalshi_fee_per_contract(0.50) == pytest.approx(0.02)
+    assert find_edge.kalshi_fee_per_contract(0.70) == pytest.approx(0.02)
+    assert find_edge.kalshi_fee_per_contract(0.95) == pytest.approx(0.01)
+    assert find_edge.kalshi_fee_per_contract(0.0) == 0.0
+    assert find_edge.kalshi_fee_per_contract(1.0) == 0.0
+
+
+def test_sizing_floor_buys_one_contract_on_small_bankroll():
+    # With an $8 bankroll, fractional Kelly suggests < 1 contract's cost.
+    # The floor should still buy 1 contract when it fits the caps.
+    import trader
+    sig = find_edge.TradeSignal(
+        ticker="KXHIGHCHI-26JUL16-B85.5", side="no", action="buy",
+        model_prob=0.85, market_price=0.72, edge=0.08,
+        expected_value=0.08, description="test")
+    orders = trader.size_orders([sig], bankroll=8.37, kelly_fraction=0.15,
+                                max_position_dollars=2.0, max_contracts=5,
+                                max_total_dollars=2.79, max_positions=6)
+    assert len(orders) == 1
+    assert orders[0].contracts == 1
+
+    # But NOT when one contract exceeds the per-position cap
+    orders = trader.size_orders([sig], bankroll=8.37, kelly_fraction=0.15,
+                                max_position_dollars=0.50, max_contracts=5,
+                                max_total_dollars=2.79, max_positions=6)
+    assert orders == []
 
 
 def test_bracket_yes_bets_disallowed():

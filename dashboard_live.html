@@ -289,8 +289,13 @@ tbody tr:hover { background: #f8f9fb; }
     <div class="grid-2">
         <div class="card">
             <div class="card-header">
-                <span class="card-title">Cumulative P&L</span>
-                <span class="card-subtitle" id="pnl-updated"></span>
+                <span class="card-title">Cumulative P&L
+                    <span id="pnl-era-label" style="font-size:11px;font-weight:400;color:#94a3b8"></span>
+                </span>
+                <span class="card-subtitle">
+                    <a href="#" id="pnl-era-toggle" style="font-size:11px;color:#3b82f6;text-decoration:none;margin-right:10px"></a>
+                    <span id="pnl-updated"></span>
+                </span>
             </div>
             <div class="chart-container"><canvas id="pnl-chart"></canvas></div>
         </div>
@@ -431,11 +436,32 @@ async function api(path, opts) {
 }
 
 // ── OVERVIEW PAGE ──────────────────────────────────
+// P&L chart defaults to the current model era (post-2026-05-23 overhaul);
+// the toggle swaps in the full history including the early losses.
+let pnlEra = 'era';  // 'era' | 'all'
+
+function setupEraToggle() {
+    const toggle = document.getElementById('pnl-era-toggle');
+    if (!toggle || toggle.dataset.bound) return;
+    toggle.dataset.bound = '1';
+    toggle.addEventListener('click', (e) => {
+        e.preventDefault();
+        pnlEra = pnlEra === 'era' ? 'all' : 'era';
+        loadOverview();
+    });
+}
+
 async function loadOverview() {
+    setupEraToggle();
+    const pnlQuery = pnlEra === 'all' ? '/api/daily_pnl?since=all' : '/api/daily_pnl';
     const [summary, daily, positions, trades, balance] = await Promise.all([
-        api('/api/summary'), api('/api/daily_pnl'), api('/api/positions'),
+        api('/api/summary'), api(pnlQuery), api('/api/positions'),
         api('/api/trades'), api('/api/balance'),
     ]);
+    document.getElementById('pnl-era-label').textContent =
+        pnlEra === 'era' ? '· since Aug 18 (current model)' : '· all time';
+    document.getElementById('pnl-era-toggle').textContent =
+        pnlEra === 'era' ? 'show all history' : 'show current model era';
     allTrades = trades || [];
 
     const s = summary || {};
