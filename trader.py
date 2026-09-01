@@ -34,7 +34,11 @@ from orderbook import analyze_orderbook
 # ── Configuration defaults (overridden by config.py if present) ────
 
 DEFAULT_KELLY_FRACTION = 0.15       # 15% Kelly (was 25% — too aggressive)
-DEFAULT_MAX_CONTRACTS = 5           # max contracts per order (was 50!)
+DEFAULT_MAX_CONTRACTS = 15          # per-order cap; real limits are the 8%
+                                    # position cap and orderbook depth cap
+                                    # (was 5, which began binding at ~$60
+                                    # bankroll; fills are reconciled so
+                                    # over-posting is accounting-safe)
 DEFAULT_MAX_POSITION_DOLLARS = 2.0  # max cost per single trade (was 5)
 DEFAULT_MAX_EXPOSURE_DOLLARS = 15.0 # max total money at risk (was 50)
 DEFAULT_MAX_POSITIONS = 6           # max simultaneous open trades (was 10)
@@ -62,6 +66,9 @@ class TradeResult:
     success: bool
     order_id: str = None
     error: str = None
+    fee_dollars: float = None   # actual exchange fee from the V2 response
+                                # (None when unknown, e.g. resting orders —
+                                # estimated at settlement instead)
 
 
 # ── Kelly criterion ────────────────────────────────────────────────
@@ -216,10 +223,22 @@ def execute_orders(client: KalshiClient, orders: list[TradeOrder],
             order_data = response.get("order", {})
             order_id = order_data.get("order_id", "unknown")
 
+            # V2 reports the actual fee for immediately-filled contracts.
+            # average_fee_paid is per contract; multiply by fill count.
+            fee = None
+            try:
+                filled = float(order_data.get("fill_count") or 0)
+                avg_fee = float(order_data.get("average_fee_paid") or 0)
+                if filled > 0 and avg_fee > 0:
+                    fee = round(avg_fee * filled, 4)
+            except (TypeError, ValueError):
+                pass
+
             results.append(TradeResult(
                 order=order,
                 success=True,
                 order_id=order_id,
+                fee_dollars=fee,
             ))
 
             # Be polite to the API
@@ -416,6 +435,153 @@ def print_results(results: list[TradeResult], dry_run: bool) -> None:
 
 # ── Main pipeline ──────────────────────────────────────────────────
 
+def _gather_signals(city_key: str, min_edge: float,
+                    tomorrow_only: bool = True) -> list[TradeSignal]:
+    """
+    Steps 1-3 of the pipeline for one city: fetch markets, predict, find
+    edges, log counterfactuals, filter to tomorrow. Returns trade signals.
+    """
+    city = CITIES[city_key]
+
+    print(f"Fetching {city.name} weather markets...")
+    markets = get_market_prices(city.kalshi_series)
+    print(f"  Found {len(markets)} open markets")
+
+    print(f"\nGenerating predictions...")
+    predictions = predict_all_for_city(city_key, markets)
+    print(f"  Generated {len(predictions)} predictions")
+
+    signals = calculate_edge(predictions, markets, min_edge=min_edge)
+    print(f"\n  Found {len(signals)} signals with edge > {min_edge:.0%}")
+
+    skips = getattr(calculate_edge, "last_skipped", [])
+    if skips:
+        try:
+            from pnl_tracker import log_skipped_signals
+            n_new = log_skipped_signals(skips)
+            print(f"  Logged {n_new} filtered signal(s) for counterfactual "
+                  f"tracking ({len(skips)} seen)")
+        except Exception as e:
+            print(f"  Warning: could not log skipped signals: {e}")
+
+    if tomorrow_only and signals:
+        pre_filter = list(signals)
+        signals = filter_tomorrow_only(signals)
+        dropped = [s for s in pre_filter if s not in signals]
+        if dropped:
+            try:
+                from pnl_tracker import log_skipped_signals
+                log_skipped_signals([{
+                    "ticker": s.ticker, "side": s.side,
+                    "model_prob": s.model_prob, "ask_price": s.market_price,
+                    "raw_gap": None, "edge": s.edge, "reason": "same_day",
+                } for s in dropped])
+            except Exception as e:
+                print(f"  Warning: could not log same-day skips: {e}")
+
+    return signals
+
+
+def run_global_pipeline(city_keys: list, dry_run: bool = True,
+                        min_edge: float = DEFAULT_MIN_EDGE,
+                        tomorrow_only: bool = True,
+                        max_spend: float = None) -> list[TradeResult]:
+    """
+    Cross-city pipeline: gather signals from EVERY city first, then size
+    them globally, best edge first, under ONE run budget.
+
+    This replaces the per-city budget split, which fragmented the run
+    budget 7 ways before knowing where the signals were — on days when
+    only one city had edges, just 1/7th of the intended capital deployed.
+    """
+    try:
+        import config
+        kelly_fraction = getattr(config, "KELLY_FRACTION", DEFAULT_KELLY_FRACTION)
+        max_position_pct = getattr(config, "MAX_POSITION_PCT", 0.08)
+        max_exposure_pct = getattr(config, "MAX_RUN_EXPOSURE_PCT", 0.25)
+        max_positions = getattr(config, "MAX_OPEN_POSITIONS", DEFAULT_MAX_POSITIONS)
+        max_contracts = getattr(config, "MAX_CONTRACTS_PER_ORDER", DEFAULT_MAX_CONTRACTS)
+    except ImportError:
+        kelly_fraction = DEFAULT_KELLY_FRACTION
+        max_position_pct, max_exposure_pct = 0.08, 0.25
+        max_positions = DEFAULT_MAX_POSITIONS
+        max_contracts = DEFAULT_MAX_CONTRACTS
+
+    # Gather signals across all cities
+    all_signals: list[TradeSignal] = []
+    for ck in city_keys:
+        print(f"\n--- {CITIES[ck].name} ---")
+        try:
+            all_signals.extend(_gather_signals(ck, min_edge, tomorrow_only))
+        except Exception as e:
+            print(f"  ERROR gathering {ck}: {e}")
+
+    if not all_signals:
+        print("\nNo profitable trades found in any city today.")
+        return []
+
+    # Best edges get budget first, regardless of which city they're in
+    all_signals.sort(key=lambda s: s.edge, reverse=True)
+    print(f"\n{len(all_signals)} signal(s) across all cities")
+
+    # Bankroll and percentage caps
+    if dry_run:
+        bankroll = 100.0
+        client = None
+        print(f"\n  [DRY RUN] Using simulated bankroll: ${bankroll:.2f}")
+    else:
+        client = create_client_from_config()
+        bankroll = client.get_balance().get("balance", 0) / 100
+        print(f"\n  Account balance: ${bankroll:.2f}")
+        if bankroll <= 0:
+            print("  ERROR: No funds available.")
+            return []
+
+    max_position = bankroll * max_position_pct
+    max_exposure = min(bankroll * max_exposure_pct, bankroll)
+    if max_spend is not None:
+        max_exposure = min(max_exposure, max_spend)
+    print(f"  Sizing: {kelly_fraction:.0%} Kelly, position cap "
+          f"${max_position:.2f} ({max_position_pct:.0%}), run cap "
+          f"${max_exposure:.2f} (global, not split per city)")
+
+    if not dry_run:
+        existing = check_existing_positions(client,
+                                            [s.ticker for s in all_signals])
+        if existing:
+            print(f"  Already have positions in: {list(existing.keys())}")
+            all_signals = [s for s in all_signals
+                           if s.ticker not in existing]
+
+    orders = size_orders(
+        all_signals, bankroll=bankroll, kelly_fraction=kelly_fraction,
+        max_position_dollars=max_position,
+        max_contracts=max_contracts,
+        max_total_dollars=max_exposure, max_positions=max_positions,
+    )
+    if not orders:
+        print("  Positions too small to trade.")
+        return []
+
+    if not dry_run:
+        orders = optimize_with_orderbook(client, orders)
+        if not orders:
+            print("  All orders filtered out by orderbook analysis.")
+            return []
+
+    print_trade_plan(orders, bankroll, dry_run)
+    results = execute_orders(client, orders, dry_run=dry_run)
+
+    if not dry_run:
+        successes = [r for r in results if r.success]
+        if successes:
+            log_trade_results(successes)
+            print(f"\n  Logged {len(successes)} trade(s) to P&L tracker.")
+
+    print_results(results, dry_run)
+    return results
+
+
 def run_trading_pipeline(city_key: str, dry_run: bool = True,
                          max_spend: float = None,
                          min_edge: float = DEFAULT_MIN_EDGE,
@@ -458,13 +624,39 @@ def run_trading_pipeline(city_key: str, dry_run: bool = True,
     signals = calculate_edge(predictions, markets, min_edge=min_edge)
     print(f"\n  Found {len(signals)} signals with edge > {min_edge:.0%}")
 
+    # Counterfactual log: record what the guardrails rejected so their
+    # would-have-been outcomes get verified at settlement.
+    skips = getattr(calculate_edge, "last_skipped", [])
+    if skips:
+        try:
+            from pnl_tracker import log_skipped_signals
+            n_new = log_skipped_signals(skips)
+            print(f"  Logged {n_new} filtered signal(s) for counterfactual "
+                  f"tracking ({len(skips)} seen)")
+        except Exception as e:
+            print(f"  Warning: could not log skipped signals: {e}")
+
     if not signals:
         print("  No profitable trades found. Market is efficient today.")
         return []
 
     # Step 3: Filter to tomorrow only (today's are too close to settlement)
     if tomorrow_only:
+        pre_filter = list(signals)
         signals = filter_tomorrow_only(signals)
+        dropped = [s for s in pre_filter if s not in signals]
+        if dropped:
+            # Same-day signals are a policy exclusion, not a math one —
+            # track their would-have-been outcomes like other skips.
+            try:
+                from pnl_tracker import log_skipped_signals
+                log_skipped_signals([{
+                    "ticker": s.ticker, "side": s.side,
+                    "model_prob": s.model_prob, "ask_price": s.market_price,
+                    "raw_gap": None, "edge": s.edge, "reason": "same_day",
+                } for s in dropped])
+            except Exception as e:
+                print(f"  Warning: could not log same-day skips: {e}")
         if not signals:
             print("  No tomorrow signals. Try --include-today for same-day contracts.")
             return []

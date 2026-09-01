@@ -25,6 +25,19 @@ from pathlib import Path
 
 DB_PATH = Path(__file__).parent / "kalshi_data.db"
 
+# Bankroll at the start of the current model era (2026-08-18), taken from
+# the trading log's balance check. Used to compute wealth growth %.
+ERA_START_BANKROLL = 47.57
+
+
+def estimate_fee(contracts: int, price_cents: int) -> float:
+    """Kalshi trading fee: ceil_to_cent(0.07 * C * P * (1-P)), in dollars."""
+    import math
+    p = price_cents / 100.0
+    if p <= 0 or p >= 1:
+        return 0.0
+    return math.ceil(0.07 * contracts * p * (1 - p) * 100) / 100
+
 
 # ── Database setup ─────────────────────────────────────────────────
 
@@ -60,24 +73,137 @@ def init_pnl_tables(conn: sqlite3.Connection) -> None:
     """)
     conn.commit()
 
+    # Migration: exchange fees (actual from V2 responses, else estimated)
+    try:
+        conn.execute("ALTER TABLE trades ADD COLUMN fee_dollars REAL")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists
+
+    # Migration: reconciled fill count (NULL = not yet reconciled)
+    try:
+        conn.execute("ALTER TABLE trades ADD COLUMN filled_contracts REAL")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+    # Counterfactual log: signals the guardrails rejected, verified at
+    # settlement so the filters themselves stay falsifiable.
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS skipped_signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            side TEXT NOT NULL,
+            reason TEXT NOT NULL,          -- credibility / price_floor / bracket_yes
+            model_prob REAL,               -- blended probability at skip time
+            ask_price REAL,
+            raw_gap REAL,                  -- raw model-market disagreement
+            edge REAL,                     -- blended, fee-adjusted edge
+            outcome TEXT,                  -- win/loss once verified
+            hypo_profit REAL,              -- 1 contract at ask, net est. fee
+            UNIQUE(ticker, side, reason)
+        );
+    """)
+    conn.commit()
+
 
 # ── Trade logging ──────────────────────────────────────────────────
 
 def log_trade(conn: sqlite3.Connection, ticker: str, side: str, action: str,
               contracts: int, price_cents: int, cost_dollars: float,
               model_prob: float = None, edge: float = None,
-              kelly_fraction: float = None, order_id: str = None):
-    """Log a trade when it's placed."""
+              kelly_fraction: float = None, order_id: str = None,
+              fee_dollars: float = None):
+    """Log a trade when it's placed. fee_dollars: actual fee if known."""
     now = datetime.now(timezone.utc).isoformat()
 
     conn.execute("""
         INSERT INTO trades (
             timestamp, ticker, side, action, contracts, price_cents,
-            cost_dollars, model_prob, edge, kelly_fraction, order_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            cost_dollars, model_prob, edge, kelly_fraction, order_id,
+            fee_dollars
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (now, ticker, side, action, contracts, price_cents,
-          cost_dollars, model_prob, edge, kelly_fraction, order_id))
+          cost_dollars, model_prob, edge, kelly_fraction, order_id,
+          fee_dollars))
     conn.commit()
+
+
+# ── Fill reconciliation ────────────────────────────────────────────
+
+def reconcile_fills(conn: sqlite3.Connection, client=None) -> int:
+    """
+    True-up unsettled trades against Kalshi's actual order state.
+
+    The optimizer sometimes posts maker orders inside the spread, which can
+    rest, fill partially, or get canceled at market close. This replaces the
+    optimistic assume-full-fill records with reality:
+      - 0 filled + canceled  -> trade row deleted (it never happened)
+      - 0 filled + resting   -> marked filled_contracts=0 (excluded from
+                                settlement scoring until it fills or dies)
+      - partial/full fill    -> contracts, cost, and fees set to the actual
+                                values from the exchange (incl. maker/taker
+                                fee split, replacing estimates)
+    Returns number of trades adjusted.
+    """
+    rows = conn.execute("""
+        SELECT id, order_id, contracts, cost_dollars FROM trades
+        WHERE settled = 0 AND order_id IS NOT NULL
+          AND order_id NOT LIKE 'DRY-%'
+    """).fetchall()
+    if not rows:
+        return 0
+
+    if client is None:
+        from kalshi_client import create_client_from_config
+        client = create_client_from_config()
+
+    adjusted = 0
+    for tid, order_id, logged_contracts, logged_cost in rows:
+        try:
+            o = client.get_order(order_id).get("order", {})
+        except Exception as e:
+            print(f"    fill-reconcile failed for {order_id}: {e}")
+            continue
+        if not o:
+            continue
+        try:
+            filled = float(o.get("fill_count_fp") or 0)
+            status = o.get("status", "")
+            cost = (float(o.get("taker_fill_cost_dollars") or 0)
+                    + float(o.get("maker_fill_cost_dollars") or 0))
+            fees = (float(o.get("taker_fees_dollars") or 0)
+                    + float(o.get("maker_fees_dollars") or 0))
+        except (TypeError, ValueError):
+            continue
+
+        if filled == 0:
+            if status == "canceled":
+                conn.execute("DELETE FROM trades WHERE id = ?", (tid,))
+                print(f"    [UNFILLED] order {order_id} canceled with no "
+                      f"fill — phantom trade removed")
+                adjusted += 1
+            else:  # still resting — exclude from scoring for now
+                conn.execute("""UPDATE trades SET filled_contracts = 0
+                                WHERE id = ?""", (tid,))
+            continue
+
+        # Partial or full fill: record reality
+        if (abs(filled - logged_contracts) > 0.001
+                or abs(cost - logged_cost) > 0.005):
+            print(f"    [RECONCILED] {order_id}: {logged_contracts} -> "
+                  f"{filled:g} contracts, cost ${logged_cost:.2f} -> "
+                  f"${cost:.2f}")
+            adjusted += 1
+        conn.execute("""
+            UPDATE trades SET contracts = ?, cost_dollars = ?,
+                              fee_dollars = ?, filled_contracts = ?
+            WHERE id = ?
+        """, (int(round(filled)), cost, fees, filled, tid))
+
+    conn.commit()
+    return adjusted
 
 
 # ── Settlement checking ────────────────────────────────────────────
@@ -91,8 +217,11 @@ def check_settlements(conn: sqlite3.Connection) -> int:
 
     # Get unsettled trades
     unsettled = conn.execute("""
-        SELECT id, ticker, side, contracts, price_cents, cost_dollars
-        FROM trades WHERE settled = 0
+        SELECT id, ticker, side, contracts, price_cents, cost_dollars,
+               fee_dollars
+        FROM trades
+        WHERE settled = 0
+          AND (filled_contracts IS NULL OR filled_contracts > 0)
     """).fetchall()
 
     if not unsettled:
@@ -121,17 +250,22 @@ def check_settlements(conn: sqlite3.Connection) -> int:
             ticker_trades = [r for r in unsettled if r[1] == ticker]
             now = datetime.now(timezone.utc).isoformat()
 
-            for trade_id, _, side, contracts, price_cents, cost in ticker_trades:
+            for trade_id, _, side, contracts, price_cents, cost, fee in ticker_trades:
                 # Did we win?
                 won = (side == result)
+
+                # Exchange fee: actual (recorded at fill) or estimated.
+                # Fees are paid at execution regardless of outcome.
+                if fee is None:
+                    fee = estimate_fee(contracts, price_cents)
 
                 if won:
                     # Payout = contracts * $1 (each contract pays $1 if correct)
                     payout = contracts * 1.0
-                    profit = payout - cost
+                    profit = payout - cost - fee
                 else:
                     payout = 0.0
-                    profit = -cost
+                    profit = -cost - fee
 
                 conn.execute("""
                     UPDATE trades SET
@@ -139,9 +273,10 @@ def check_settlements(conn: sqlite3.Connection) -> int:
                         settlement_result = ?,
                         payout_dollars = ?,
                         profit_dollars = ?,
+                        fee_dollars = ?,
                         settled_at = ?
                     WHERE id = ?
-                """, (result, payout, profit, now, trade_id))
+                """, (result, payout, profit, fee, now, trade_id))
 
                 result_str = "WIN" if won else "LOSS"
                 print(f"    [{result_str}] {ticker} — {side.upper()} x{contracts} — "
@@ -157,16 +292,24 @@ def check_settlements(conn: sqlite3.Connection) -> int:
 
 # ── Performance reporting ──────────────────────────────────────────
 
-def get_summary(conn: sqlite3.Connection) -> dict:
-    """Compute overall performance statistics."""
+def get_summary(conn: sqlite3.Connection, since: str = None) -> dict:
+    """
+    Compute overall performance statistics.
+
+    since: only count trades on/after this date (e.g. '2026-08-18' scopes
+    the stats to the current model era). Default: all trades.
+    """
     stats = {}
+    w = "WHERE timestamp >= ?" if since else "WHERE 1=1"
+    p = (since,) if since else ()
 
     # Total trades
-    row = conn.execute("SELECT COUNT(*) FROM trades").fetchone()
+    row = conn.execute(f"SELECT COUNT(*) FROM trades {w}", p).fetchone()
     stats["total_trades"] = row[0]
 
     # Settled trades
-    row = conn.execute("SELECT COUNT(*) FROM trades WHERE settled = 1").fetchone()
+    row = conn.execute(
+        f"SELECT COUNT(*) FROM trades {w} AND settled = 1", p).fetchone()
     stats["settled_trades"] = row[0]
 
     # Unsettled (pending)
@@ -177,8 +320,8 @@ def get_summary(conn: sqlite3.Connection) -> dict:
 
     # Win/loss
     row = conn.execute("""
-        SELECT COUNT(*) FROM trades WHERE settled = 1 AND profit_dollars > 0
-    """).fetchone()
+        SELECT COUNT(*) FROM trades {w} AND settled = 1 AND profit_dollars > 0
+    """.format(w=w), p).fetchone()
     stats["wins"] = row[0]
     stats["losses"] = stats["settled_trades"] - stats["wins"]
     stats["win_rate"] = stats["wins"] / stats["settled_trades"]
@@ -186,8 +329,8 @@ def get_summary(conn: sqlite3.Connection) -> dict:
     # P&L
     row = conn.execute("""
         SELECT SUM(profit_dollars), SUM(cost_dollars), SUM(payout_dollars)
-        FROM trades WHERE settled = 1
-    """).fetchone()
+        FROM trades {w} AND settled = 1
+    """.format(w=w), p).fetchone()
     stats["total_pnl"] = row[0] or 0
     stats["total_invested"] = row[1] or 0
     stats["total_payout"] = row[2] or 0
@@ -196,30 +339,72 @@ def get_summary(conn: sqlite3.Connection) -> dict:
     # Average edge and profit per trade
     row = conn.execute("""
         SELECT AVG(edge), AVG(profit_dollars), AVG(cost_dollars)
-        FROM trades WHERE settled = 1
-    """).fetchone()
+        FROM trades {w} AND settled = 1
+    """.format(w=w), p).fetchone()
     stats["avg_edge"] = row[0] or 0
     stats["avg_profit"] = row[1] or 0
     stats["avg_cost"] = row[2] or 0
 
+    # Total exchange fees paid (actual where known, else estimated)
+    row = conn.execute("""
+        SELECT SUM(COALESCE(fee_dollars, 0)) FROM trades {w} AND settled = 1
+    """.format(w=w), p).fetchone()
+    stats["total_fees"] = row[0] or 0
+
+    # Wealth growth: net P&L relative to the era's starting bankroll,
+    # overall and as a geometric daily rate. Only meaningful when the
+    # window starts at the era boundary (deposits before that are unknown).
+    if since:
+        row = conn.execute(
+            f"SELECT MIN(DATE(timestamp)) FROM trades {w}", p).fetchone()
+        first_day = row[0]
+        if first_day and ERA_START_BANKROLL > 0:
+            days = max((datetime.now(timezone.utc).date()
+                        - datetime.strptime(first_day, "%Y-%m-%d").date()).days, 1)
+            growth = stats["total_pnl"] / ERA_START_BANKROLL
+            stats["wealth_growth_pct"] = growth * 100
+            stats["daily_growth_pct"] = ((1 + growth) ** (1 / days) - 1) * 100
+            stats["growth_days"] = days
+
+            # Latest settlement day: P&L that day as a % of the bankroll
+            # going INTO that day (not an average — the actual day's move).
+            row = conn.execute(f"""
+                SELECT MAX(DATE(settled_at)) FROM trades {w} AND settled = 1
+            """, p).fetchone()
+            latest = row[0]
+            if latest:
+                day_pnl = conn.execute(f"""
+                    SELECT COALESCE(SUM(profit_dollars), 0) FROM trades
+                    {w} AND settled = 1 AND DATE(settled_at) = ?
+                """, p + (latest,)).fetchone()[0]
+                pnl_before = conn.execute(f"""
+                    SELECT COALESCE(SUM(profit_dollars), 0) FROM trades
+                    {w} AND settled = 1 AND DATE(settled_at) < ?
+                """, p + (latest,)).fetchone()[0]
+                bankroll_before = ERA_START_BANKROLL + pnl_before
+                if bankroll_before > 0:
+                    stats["latest_day"] = latest
+                    stats["latest_day_pnl"] = day_pnl
+                    stats["latest_day_growth_pct"] = day_pnl / bankroll_before * 100
+
     # Best and worst trades
     row = conn.execute("""
-        SELECT ticker, profit_dollars FROM trades WHERE settled = 1
+        SELECT ticker, profit_dollars FROM trades {w} AND settled = 1
         ORDER BY profit_dollars DESC LIMIT 1
-    """).fetchone()
+    """.format(w=w), p).fetchone()
     stats["best_trade"] = {"ticker": row[0], "profit": row[1]} if row else None
 
     row = conn.execute("""
-        SELECT ticker, profit_dollars FROM trades WHERE settled = 1
+        SELECT ticker, profit_dollars FROM trades {w} AND settled = 1
         ORDER BY profit_dollars ASC LIMIT 1
-    """).fetchone()
+    """.format(w=w), p).fetchone()
     stats["worst_trade"] = {"ticker": row[0], "profit": row[1]} if row else None
 
     # Current streak
     recent = conn.execute("""
-        SELECT profit_dollars FROM trades WHERE settled = 1
+        SELECT profit_dollars FROM trades {w} AND settled = 1
         ORDER BY settled_at DESC
-    """).fetchall()
+    """.format(w=w), p).fetchall()
 
     streak = 0
     if recent:
@@ -477,10 +662,110 @@ def log_trade_results(results: list, conn: sqlite3.Connection = None) -> None:
             edge=r.order.edge,
             kelly_fraction=r.order.kelly_fraction,
             order_id=r.order_id,
+            fee_dollars=getattr(r, "fee_dollars", None),
         )
 
     if close_after:
         conn.close()
+
+
+# ── Counterfactual tracking of filtered signals ────────────────────
+
+def log_skipped_signals(skips: list, conn: sqlite3.Connection = None) -> int:
+    """Record guardrail-rejected signals (from find_edge) for later scoring.
+    Deduplicated per (ticker, side, reason)."""
+    if not skips:
+        return 0
+    close_after = conn is None
+    if conn is None:
+        conn = sqlite3.connect(str(DB_PATH))
+    init_pnl_tables(conn)
+    now = datetime.now(timezone.utc).isoformat()
+    n = 0
+    for s in skips:
+        cur = conn.execute("""
+            INSERT OR IGNORE INTO skipped_signals
+            (created_at, ticker, side, reason, model_prob, ask_price,
+             raw_gap, edge)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (now, s["ticker"], s["side"], s["reason"], s["model_prob"],
+              s["ask_price"], s["raw_gap"], s["edge"]))
+        n += cur.rowcount
+    conn.commit()
+    if close_after:
+        conn.close()
+    return n
+
+
+def verify_skipped_signals(conn: sqlite3.Connection) -> int:
+    """Score unverified skipped signals against Kalshi's settled results."""
+    from kalshi_client import create_client_from_config
+
+    rows = conn.execute("""
+        SELECT id, ticker, side, ask_price FROM skipped_signals
+        WHERE outcome IS NULL
+    """).fetchall()
+    if not rows:
+        return 0
+
+    client = create_client_from_config()
+    verified = 0
+    for sid, ticker, side, ask in rows:
+        try:
+            market = client.get_market(ticker).get("market", {})
+            if market.get("status") not in ("settled", "finalized"):
+                continue
+            result = market.get("result", "")
+            if result not in ("yes", "no"):
+                continue
+            won = (side == result)
+            fee = estimate_fee(1, int(round(ask * 100)))
+            profit = (1 - ask - fee) if won else (-ask - fee)
+            conn.execute("""
+                UPDATE skipped_signals SET outcome = ?, hypo_profit = ?
+                WHERE id = ?
+            """, ("win" if won else "loss", profit, sid))
+            verified += 1
+        except Exception as e:
+            print(f"    skipped-signal verify failed for {ticker}: {e}")
+    conn.commit()
+    if verified:
+        print(f"  Verified {verified} skipped signal(s) (counterfactuals)")
+    return verified
+
+
+def print_skipped_report(conn: sqlite3.Connection) -> None:
+    """Would-have-been record of everything the guardrails rejected."""
+    print(f"\n{'=' * 62}")
+    print("  FILTERED-SIGNAL COUNTERFACTUALS (would-have-been record)")
+    print(f"{'=' * 62}")
+    rows = conn.execute("""
+        SELECT reason, COUNT(*),
+               SUM(outcome IS NOT NULL),
+               SUM(CASE WHEN outcome = 'win' THEN 1 ELSE 0 END),
+               AVG(CASE WHEN outcome IS NOT NULL THEN model_prob END),
+               SUM(hypo_profit),
+               SUM(CASE WHEN outcome IS NOT NULL THEN ask_price ELSE 0 END)
+        FROM skipped_signals GROUP BY reason ORDER BY 2 DESC
+    """).fetchall()
+    if not rows:
+        print("  Nothing logged yet — accumulates from the next run onward.")
+        return
+    for reason, total, ver, wins, avg_p, pnl, staked in rows:
+        ver = ver or 0
+        print(f"\n  {reason}: {total} logged, {ver} verified")
+        if ver:
+            wr = (wins or 0) / ver
+            roi = (pnl or 0) / staked * 100 if staked else 0
+            print(f"    would-have-been: {wins}/{ver} wins ({wr:.0%}) vs "
+                  f"claimed {avg_p:.0%} | hypo P&L ${pnl or 0:+.2f} "
+                  f"({roi:+.0f}% ROI at 1 contract each)")
+            if reason == "credibility" and ver >= 20:
+                verdict = ("FILTER JUSTIFIED — skips would have lost"
+                           if (pnl or 0) < 0 else
+                           "FILTER MAY BE TOO STRICT — skips would have won; "
+                           "consider raising MAX_CREDIBLE_EDGE")
+                print(f"    → {verdict}")
 
 
 # ── CLI ────────────────────────────────────────────────────────────
@@ -490,7 +775,8 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="P&L Tracker for Kalshi trading bot")
     parser.add_argument("command", nargs="?", default="summary",
-                        choices=["summary", "trades", "update", "daily", "calibration"],
+                        choices=["summary", "trades", "update", "daily",
+                                 "calibration", "skipped"],
                         help="What to show (default: summary)")
     parser.add_argument("--since", type=str, default=None,
                         help="Only score trades on/after this date "
@@ -520,5 +806,8 @@ if __name__ == "__main__":
 
     elif args.command == "calibration":
         print_calibration(conn, since=args.since)
+
+    elif args.command == "skipped":
+        print_skipped_report(conn)
 
     conn.close()

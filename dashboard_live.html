@@ -453,9 +453,9 @@ function setupEraToggle() {
 
 async function loadOverview() {
     setupEraToggle();
-    const pnlQuery = pnlEra === 'all' ? '/api/daily_pnl?since=all' : '/api/daily_pnl';
+    const eraQ = pnlEra === 'all' ? '?since=all' : '';
     const [summary, daily, positions, trades, balance] = await Promise.all([
-        api('/api/summary'), api(pnlQuery), api('/api/positions'),
+        api('/api/summary' + eraQ), api('/api/daily_pnl' + eraQ), api('/api/positions'),
         api('/api/trades'), api('/api/balance'),
     ]);
     document.getElementById('pnl-era-label').textContent =
@@ -474,6 +474,13 @@ async function loadOverview() {
         { label: 'ROI', value: s.roi != null ? fmt(s.roi, 1) + '%' : '—', cls: s.roi > 0 ? 'text-green' : s.roi < 0 ? 'text-red' : '' },
         { label: 'Trades', value: s.total_trades || 0, sub: (s.pending_trades || 0) + ' pending' },
         { label: 'Streak', value: s.streak != null ? (s.streak > 0 ? s.streak + 'W' : s.streak < 0 ? Math.abs(s.streak) + 'L' : '—') : '—', cls: s.streak > 0 ? 'text-green' : s.streak < 0 ? 'text-red' : '' },
+        { label: 'Wealth Growth', value: s.wealth_growth_pct != null ? (s.wealth_growth_pct >= 0 ? '+' : '') + fmt(s.wealth_growth_pct, 1) + '%' : '—',
+          sub: s.daily_growth_pct != null ? (s.daily_growth_pct >= 0 ? '+' : '') + fmt(s.daily_growth_pct, 2) + '%/day over ' + s.growth_days + 'd' : 'era view only',
+          cls: s.wealth_growth_pct > 0 ? 'text-green' : s.wealth_growth_pct < 0 ? 'text-red' : '' },
+        { label: 'Fees Paid', value: s.total_fees != null ? fmtDollars(s.total_fees) : '—', sub: 'included in P&L' },
+        { label: 'Latest Day', value: s.latest_day_growth_pct != null ? (s.latest_day_growth_pct >= 0 ? '+' : '') + fmt(s.latest_day_growth_pct, 2) + '%' : '—',
+          sub: s.latest_day != null ? (s.latest_day_pnl >= 0 ? '+' : '') + fmtDollars(s.latest_day_pnl) + ' settled ' + s.latest_day : 'no settlements yet',
+          cls: s.latest_day_growth_pct > 0 ? 'text-green' : s.latest_day_growth_pct < 0 ? 'text-red' : '' },
     ];
     document.getElementById('metrics').innerHTML = items.map(m =>
         `<div class="metric-card"><div class="metric-label">${m.label}</div><div class="metric-value ${m.cls||''}">${m.value}</div>${m.sub ? `<div class="metric-sub">${m.sub}</div>` : ''}</div>`

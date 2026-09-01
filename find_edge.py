@@ -119,6 +119,7 @@ def calculate_edge(predictions: list[ContractPrediction],
     ALLOW_BRACKET_YES = False  # bracket YES bets are -80% ROI — never take them
 
     signals = []
+    skipped = []
 
     for pred in predictions:
         market = market_lookup.get(pred.ticker)
@@ -152,12 +153,35 @@ def calculate_edge(predictions: list[ContractPrediction],
         yes_credible = raw_yes <= MAX_CREDIBLE_EDGE
         no_credible = raw_no <= MAX_CREDIBLE_EDGE
 
+        # ── Counterfactual logging of filtered signals ─────────────
+        # Every signal a guardrail rejects gets recorded so its would-have-
+        # been outcome can be verified at settlement. This keeps the filters
+        # falsifiable: if the credibility cap (fitted on the OLD model's
+        # trades) is now discarding winners, skipped_signals will show it.
+        def _skip(side, prob, ask, raw, edge, reason):
+            skipped.append({
+                "ticker": pred.ticker, "side": side, "model_prob": prob,
+                "ask_price": ask, "raw_gap": raw, "edge": edge,
+                "reason": reason,
+            })
+
+        if (not yes_credible) and yes_edge >= min_edge:
+            _skip("yes", yes_blend_prob, yes_ask, raw_yes, yes_edge, "credibility")
+        elif yes_credible and yes_edge >= min_edge and yes_ask < MIN_YES_PRICE:
+            _skip("yes", yes_blend_prob, yes_ask, raw_yes, yes_edge, "price_floor")
+
+        if (not no_credible) and no_edge >= min_edge:
+            _skip("no", no_blend_prob, no_ask, raw_no, no_edge, "credibility")
+        elif no_credible and no_edge >= min_edge and no_ask < MIN_NO_PRICE:
+            _skip("no", no_blend_prob, no_ask, raw_no, no_edge, "price_floor")
+
         # Signal YES trade (with strict filters)
         if yes_credible and yes_edge >= min_edge and yes_ask >= MIN_YES_PRICE:
             # Block bracket YES bets entirely — model can't pick 1°F ranges
             is_bracket = pred.contract_type == "bracket"
             if is_bracket and not ALLOW_BRACKET_YES:
-                pass  # skip
+                _skip("yes", yes_blend_prob, yes_ask, raw_yes, yes_edge,
+                      "bracket_yes")
             else:
                 signals.append(TradeSignal(
                     ticker=pred.ticker,
@@ -187,6 +211,9 @@ def calculate_edge(predictions: list[ContractPrediction],
 
     # Sort by edge (best opportunities first)
     signals.sort(key=lambda s: s.edge, reverse=True)
+    # Expose filtered candidates for counterfactual logging (attribute keeps
+    # the return signature stable for existing callers).
+    calculate_edge.last_skipped = skipped
     return signals
 
 

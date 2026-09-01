@@ -58,8 +58,11 @@ def index():
 
 @app.route("/api/summary")
 def api_summary():
+    # Same era scoping as /api/daily_pnl: defaults to the current model
+    # era, ?since=all for lifetime stats.
+    since = request.args.get("since", MODEL_ERA_START)
     conn = get_db()
-    summary = get_summary(conn)
+    summary = get_summary(conn, since=None if since == "all" else since)
     conn.close()
     return jsonify(summary)
 

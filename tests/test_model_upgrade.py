@@ -415,10 +415,10 @@ def test_pct_sizing_full_pipeline_dry_run(monkeypatch):
 
     assert len(results) == 1
     order = results[0].order
-    # $100 dry-run bankroll, quarter-Kelly f=0.067 -> $6.68 -> 9 contracts,
-    # clipped by the 5-contract liquidity guard -> 5 x 70c = $3.50
-    assert order.contracts == 5
-    assert order.cost_dollars == pytest.approx(3.50)
+    # $100 dry-run bankroll, quarter-Kelly f=0.067 -> $6.68 -> 9 contracts
+    # (cap raised 5 -> 15, so Kelly is no longer clipped at this scale)
+    assert order.contracts == 9
+    assert order.cost_dollars == pytest.approx(6.30)
     # position must respect the 8% ceiling of the dry-run bankroll
     assert order.cost_dollars <= 100.0 * 0.08
 
@@ -445,3 +445,248 @@ def test_pct_sizing_scales_with_bankroll():
     # and the per-position % ceiling binds identically at both scales
     assert small[0].cost_dollars <= 50 * 0.08 + 0.70
     assert large[0].cost_dollars <= 500 * 0.08 + 0.70
+
+
+# ── fee-true P&L + wealth growth ────────────────────────────────────
+
+def test_fee_estimate_matches_kalshi_formula():
+    from pnl_tracker import estimate_fee
+    # ceil_to_cent(0.07 * C * P * (1-P)): 2 contracts @ 70c
+    # 0.07*2*0.7*0.3 = 0.0294 -> ceil to $0.03
+    assert estimate_fee(2, 70) == pytest.approx(0.03)
+    assert estimate_fee(1, 50) == pytest.approx(0.02)  # 0.0175 -> 0.02
+    assert estimate_fee(5, 99) == pytest.approx(0.01)  # 0.0035 -> 0.01
+    assert estimate_fee(1, 0) == 0.0
+
+
+def test_settlement_profit_is_net_of_fees(tmp_path, monkeypatch):
+    import pnl_tracker as pt
+    conn = sqlite3.connect(tmp_path / "pnl.db")
+    pt.init_pnl_tables(conn)
+    # winning trade: 2x @ 70c, fee recorded at fill = $0.03
+    pt.log_trade(conn, "T-WIN", "no", "buy", 2, 70, 1.40, fee_dollars=0.03)
+    # losing trade: 1x @ 50c, no fee recorded -> estimated at settlement
+    pt.log_trade(conn, "T-LOSS", "yes", "buy", 1, 50, 0.50)
+
+    class FakeClient:
+        def get_market(self, ticker):
+            return {"market": {"status": "finalized",
+                               "result": "no" if ticker == "T-WIN" else "no"}}
+    import kalshi_client
+    monkeypatch.setattr(kalshi_client, "create_client_from_config",
+                        lambda: FakeClient())
+    n = pt.check_settlements(conn)
+    assert n == 2
+
+    win = conn.execute("SELECT profit_dollars, fee_dollars FROM trades WHERE ticker='T-WIN'").fetchone()
+    assert win[0] == pytest.approx(2.0 - 1.40 - 0.03)   # payout - cost - fee
+    loss = conn.execute("SELECT profit_dollars, fee_dollars FROM trades WHERE ticker='T-LOSS'").fetchone()
+    assert loss[1] == pytest.approx(0.02)                # estimated fee
+    assert loss[0] == pytest.approx(-0.50 - 0.02)
+
+
+def test_summary_growth_metrics(tmp_path):
+    import pnl_tracker as pt
+    conn = sqlite3.connect(tmp_path / "pnl.db")
+    pt.init_pnl_tables(conn)
+    conn.execute("""INSERT INTO trades (timestamp, ticker, side, action, contracts,
+        price_cents, cost_dollars, settled, profit_dollars, payout_dollars, fee_dollars, settled_at)
+        VALUES ('2026-08-19T12:00:00', 'T', 'no', 'buy', 2, 70, 1.40, 1, 4.7570, 6.0, 0.03, '2026-08-20')""")
+    conn.commit()
+    s = pt.get_summary(conn, since="2026-08-18")
+    # profit of 4.757 on the 47.57 era baseline = exactly +10% growth
+    assert s["wealth_growth_pct"] == pytest.approx(10.0, abs=0.01)
+    assert s["daily_growth_pct"] > 0
+    assert s["total_fees"] == pytest.approx(0.03)
+    # no growth metrics without a since window (baseline unknown)
+    s_all = pt.get_summary(conn)
+    assert "wealth_growth_pct" not in s_all
+
+
+# ── counterfactual tracking of filtered signals ─────────────────────
+
+def _pred_for_skip(ticker, prob, ctype="threshold"):
+    p = MagicMock()
+    p.ticker = ticker
+    p.model_probability = prob
+    p.contract_type = ctype
+    p.description = "test"
+    return p
+
+
+def test_credibility_skips_are_recorded():
+    """A >25c raw disagreement must be skipped AND logged as a
+    counterfactual with reason='credibility'."""
+    pred = _pred_for_skip("KXHIGHDEN-26SEP02-T87", 0.05)  # P(no)=0.95
+    markets = [{"ticker": pred.ticker, "yes_ask_dollars": "0.35",
+                "no_ask_dollars": "0.65", "title": "high > 87"}]  # raw_no=0.30
+    signals = find_edge.calculate_edge([pred], markets, min_edge=0.05)
+    assert signals == []
+    skips = find_edge.calculate_edge.last_skipped
+    assert len(skips) == 1
+    assert skips[0]["reason"] == "credibility"
+    assert skips[0]["side"] == "no"
+    assert skips[0]["raw_gap"] == pytest.approx(0.30)
+
+
+def test_price_floor_skips_are_recorded():
+    """A credible NO edge below the 68c ask floor gets logged as
+    reason='price_floor' (this is the Denver pattern)."""
+    pred = _pred_for_skip("KXHIGHAUS-26SEP02-B100.5", 0.264, ctype="bracket")
+    markets = [{"ticker": pred.ticker, "yes_ask_dollars": "0.52",
+                "no_ask_dollars": "0.49", "title": "100-101"}]  # raw_no=0.246
+    find_edge.calculate_edge([pred], markets, min_edge=0.05)
+    skips = find_edge.calculate_edge.last_skipped
+    floor = [s for s in skips if s["reason"] == "price_floor" and s["side"] == "no"]
+    assert len(floor) == 1
+    assert floor[0]["ask_price"] == pytest.approx(0.49)
+
+
+def test_skipped_signals_log_and_verify(tmp_path, monkeypatch):
+    import pnl_tracker as pt
+    conn = sqlite3.connect(tmp_path / "pnl.db")
+    pt.init_pnl_tables(conn)
+
+    skips = [{"ticker": "KXHIGHLAX-26SEP02-B77.5", "side": "no",
+              "model_prob": 0.86, "ask_price": 0.44, "raw_gap": 0.42,
+              "edge": 0.20, "reason": "credibility"}]
+    assert pt.log_skipped_signals(skips, conn) == 1
+    assert pt.log_skipped_signals(skips, conn) == 0  # dedupe
+
+    class FakeClient:
+        def get_market(self, ticker):
+            return {"market": {"status": "finalized", "result": "no"}}
+    import kalshi_client
+    monkeypatch.setattr(kalshi_client, "create_client_from_config",
+                        lambda: FakeClient())
+    assert pt.verify_skipped_signals(conn) == 1
+
+    out, prof = conn.execute(
+        "SELECT outcome, hypo_profit FROM skipped_signals").fetchone()
+    assert out == "win"
+    # 1 contract at 44c wins: 1 - 0.44 - fee(0.02) = 0.54
+    assert prof == pytest.approx(0.54, abs=0.01)
+
+
+# ── fill reconciliation (phantom-trade guard) ───────────────────────
+
+def _reconcile_db(tmp_path):
+    import pnl_tracker as pt
+    conn = sqlite3.connect(tmp_path / "pnl.db")
+    pt.init_pnl_tables(conn)
+    pt.log_trade(conn, "T-A", "no", "buy", 4, 70, 2.80, order_id="ord-a")
+    pt.log_trade(conn, "T-B", "no", "buy", 4, 70, 2.80, order_id="ord-b")
+    pt.log_trade(conn, "T-C", "no", "buy", 2, 60, 1.20, order_id="ord-c")
+    return pt, conn
+
+
+class _OrderClient:
+    def __init__(self, orders): self.orders = orders
+    def get_order(self, oid): return {"order": self.orders[oid]}
+
+
+def test_reconcile_removes_phantom_and_fixes_partials(tmp_path):
+    pt, conn = _reconcile_db(tmp_path)
+    client = _OrderClient({
+        # never filled, canceled at close -> phantom, must be deleted
+        "ord-a": {"status": "canceled", "fill_count_fp": "0.00",
+                  "taker_fill_cost_dollars": "0", "maker_fill_cost_dollars": "0",
+                  "taker_fees_dollars": "0", "maker_fees_dollars": "0"},
+        # partial fill 2 of 4 as maker -> contracts/cost/fees corrected
+        "ord-b": {"status": "canceled", "fill_count_fp": "2.00",
+                  "taker_fill_cost_dollars": "0",
+                  "maker_fill_cost_dollars": "1.40",
+                  "taker_fees_dollars": "0", "maker_fees_dollars": "0.00"},
+        # full fill as taker with actual fee -> fee replaces estimate
+        "ord-c": {"status": "executed", "fill_count_fp": "2.00",
+                  "taker_fill_cost_dollars": "1.20",
+                  "maker_fill_cost_dollars": "0",
+                  "taker_fees_dollars": "0.04", "maker_fees_dollars": "0"},
+    })
+    adjusted = pt.reconcile_fills(conn, client=client)
+    assert adjusted >= 2
+
+    assert conn.execute("SELECT COUNT(*) FROM trades WHERE ticker='T-A'").fetchone()[0] == 0
+    b = conn.execute("SELECT contracts, cost_dollars, fee_dollars FROM trades WHERE ticker='T-B'").fetchone()
+    assert b == (2, 1.40, 0.0)
+    c = conn.execute("SELECT fee_dollars FROM trades WHERE ticker='T-C'").fetchone()
+    assert c[0] == pytest.approx(0.04)
+
+
+def test_unfilled_resting_excluded_from_settlement(tmp_path, monkeypatch):
+    pt, conn = _reconcile_db(tmp_path)
+    client = _OrderClient({
+        "ord-a": {"status": "resting", "fill_count_fp": "0.00",
+                  "taker_fill_cost_dollars": "0", "maker_fill_cost_dollars": "0",
+                  "taker_fees_dollars": "0", "maker_fees_dollars": "0"},
+        "ord-b": {"status": "executed", "fill_count_fp": "4.00",
+                  "taker_fill_cost_dollars": "2.80", "maker_fill_cost_dollars": "0",
+                  "taker_fees_dollars": "0.06", "maker_fees_dollars": "0"},
+        "ord-c": {"status": "executed", "fill_count_fp": "2.00",
+                  "taker_fill_cost_dollars": "1.20", "maker_fill_cost_dollars": "0",
+                  "taker_fees_dollars": "0.04", "maker_fees_dollars": "0"},
+    })
+    pt.reconcile_fills(conn, client=client)
+
+    class SettleClient:
+        def get_market(self, ticker):
+            return {"market": {"status": "finalized", "result": "no"}}
+    import kalshi_client
+    monkeypatch.setattr(kalshi_client, "create_client_from_config",
+                        lambda: SettleClient())
+    n = pt.check_settlements(conn)
+    # only the two FILLED trades score; the resting zero-fill must not
+    assert n == 2
+    assert conn.execute("SELECT settled FROM trades WHERE ticker='T-A'").fetchone()[0] == 0
+
+
+# ── global cross-city sizing (budget defragmentation) ───────────────
+
+def test_global_pipeline_pools_budget_across_cities(monkeypatch):
+    """One city with 3 strong signals must be able to use the FULL run
+    budget — the per-city split previously capped it at 1/7th."""
+    import trader
+
+    sigs = {
+        "nyc": [find_edge.TradeSignal(
+            ticker=f"KXHIGHNY-99DEC31-B{70+i}.5", side="no", action="buy",
+            model_prob=0.80, market_price=0.70, edge=0.08 - i * 0.01,
+            expected_value=0.08, description="t") for i in range(3)],
+    }
+    monkeypatch.setattr(trader, "_gather_signals",
+                        lambda ck, me, to=True: sigs.get(ck, []))
+
+    results = trader.run_global_pipeline(
+        ["chicago", "nyc", "miami", "denver", "austin", "la", "philly"],
+        dry_run=True)
+
+    total = sum(r.order.cost_dollars for r in results)
+    # $100 dry bankroll: quarter-Kelly ~6.7% -> ~$6.68/order x3 ≈ $20,
+    # position cap 8% ($8) not binding, run cap 25% ($25) not binding.
+    # Old per-city split would have allowed only 25/7 = $3.57 TOTAL for nyc.
+    assert len(results) == 3
+    assert total > 10.0, f"budget still fragmented: only ${total:.2f} deployed"
+    assert total <= 25.0 + 0.70  # never exceeds global run cap
+
+
+def test_global_pipeline_sizes_best_edge_first(monkeypatch):
+    """When the run cap binds, the highest-edge signals get filled first
+    regardless of which city they came from."""
+    import trader
+
+    def fake_gather(ck, me, to=True):
+        if ck == "chicago":   # weaker edge
+            return [find_edge.TradeSignal(
+                ticker="KXHIGHCHI-99DEC31-B80.5", side="no", action="buy",
+                model_prob=0.76, market_price=0.70, edge=0.04,
+                expected_value=0.04, description="weak")]
+        if ck == "nyc":       # stronger edge
+            return [find_edge.TradeSignal(
+                ticker="KXHIGHNY-99DEC31-B75.5", side="no", action="buy",
+                model_prob=0.85, market_price=0.70, edge=0.13,
+                expected_value=0.13, description="strong")]
+        return []
+
+    monkeypatch.setattr(trader, "_gather_signals", fake_gather)
+    results = trader.run_global_pipeline(["chicago", "nyc"], dry_run=True)
+    assert results[0].order.ticker.startswith("KXHIGHNY")  # best edge first

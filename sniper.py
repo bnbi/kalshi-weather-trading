@@ -31,6 +31,17 @@ Usage:
 
 from __future__ import annotations
 
+# Silence the cosmetic LibreSSL warning that urllib3 prints on macOS —
+# it fires once per run into stderr and looks like an error while meaning
+# nothing. Must run before the first `import requests`.
+import warnings as _warnings
+try:
+    from urllib3.exceptions import NotOpenSSLWarning as _NotOpenSSL
+    _warnings.filterwarnings("ignore", category=_NotOpenSSL)
+except Exception:
+    pass
+
+
 import sqlite3
 import time
 import uuid

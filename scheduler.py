@@ -21,6 +21,17 @@ Usage:
 
 from __future__ import annotations
 
+# Silence the cosmetic LibreSSL warning that urllib3 prints on macOS —
+# it fires once per run into stderr and looks like an error while meaning
+# nothing. Must run before the first `import requests`.
+import warnings as _warnings
+try:
+    from urllib3.exceptions import NotOpenSSLWarning as _NotOpenSSL
+    _warnings.filterwarnings("ignore", category=_NotOpenSSL)
+except Exception:
+    pass
+
+
 import os
 import sys
 import time
@@ -177,10 +188,18 @@ def run_once(cities: list[str] = None, max_spend: float = None,
         import sqlite3
         pnl_conn = sqlite3.connect(str(Path(__file__).parent / "kalshi_data.db"))
         init_pnl_tables(pnl_conn)
+        # True-up fills BEFORE scoring: resting maker orders may have
+        # filled partially, fully, or not at all since the last run.
+        from pnl_tracker import reconcile_fills
+        reconcile_fills(pnl_conn)
         settled = check_settlements(pnl_conn)
         if settled > 0:
             logger.info(f"  Settled {settled} trade(s) from previous days")
             print_summary(pnl_conn)
+        # Score guardrail-rejected signals against settled results so the
+        # filters themselves stay falsifiable (see pnl_tracker skipped).
+        from pnl_tracker import verify_skipped_signals
+        verify_skipped_signals(pnl_conn)
         pnl_conn.close()
     except Exception as e:
         logger.warning(f"  Could not check settlements: {e}")
@@ -193,31 +212,14 @@ def run_once(cities: list[str] = None, max_spend: float = None,
         available = balance.get("balance", 0) / 100  # API returns cents
         logger.info(f"  Account balance: ${available:.2f}")
 
-        # Budget is a percentage of the live bankroll (scale-invariant);
-        # an explicit --max-spend still overrides it as a hard ceiling.
-        try:
-            from config import MAX_RUN_EXPOSURE_PCT
-        except ImportError:
-            MAX_RUN_EXPOSURE_PCT = 0.25
-        total_budget = available * MAX_RUN_EXPOSURE_PCT
-        if max_spend is not None:
-            total_budget = min(total_budget, max_spend)
-        total_budget = min(total_budget, available)
-        logger.info(f"  Run budget: ${total_budget:.2f} "
-                    f"({MAX_RUN_EXPOSURE_PCT:.0%} of bankroll)")
-
-        # Divide budget across cities so no single city hogs all funds
-        per_city_budget = total_budget / len(cities)
-        logger.info(f"  Budget: ${total_budget:.2f} total, "
-                    f"${per_city_budget:.2f} per city")
+        # Budget is computed inside the global pipeline as a percentage
+        # of the live bankroll; --max-spend still overrides as a ceiling.
     except Exception as e:
         logger.error(f"  Could not fetch balance: {e}")
         logger.error(f"  Aborting run for safety.")
         return
 
-    total_results = _execute_trading(
-        cities, total_budget, per_city_budget, min_edge, logger
-    )
+    total_results = _execute_trading(cities, max_spend, min_edge, logger)
 
     # If we ran before 6:30am and placed 0 orders, tomorrow's markets
     # probably aren't posted yet.  Wait until 7am and retry once.
@@ -232,23 +234,7 @@ def run_once(cities: list[str] = None, max_spend: float = None,
         time.sleep(wait_seconds)
 
         logger.info("\n  RETRYING at 7:00am...")
-        # Re-fetch balance in case it changed
-        try:
-            balance = client.get_balance()
-            available = balance.get("balance", 0) / 100
-            total_budget = available * MAX_RUN_EXPOSURE_PCT
-            if max_spend is not None:
-                total_budget = min(total_budget, max_spend)
-            total_budget = min(total_budget, available)
-            per_city_budget = total_budget / len(cities)
-            logger.info(f"  Account balance: ${available:.2f}")
-        except Exception as e:
-            logger.error(f"  Could not re-fetch balance: {e}")
-            return
-
-        total_results = _execute_trading(
-            cities, total_budget, per_city_budget, min_edge, logger
-        )
+        total_results = _execute_trading(cities, max_spend, min_edge, logger)
         successes = [r for r in total_results if r.success]
 
     logger.info(f"\nRUN COMPLETE: {len(successes)} orders placed across {len(cities)} cities")
@@ -292,64 +278,107 @@ class _LoggerWriter:
         self._buf = ""
 
 
-def _execute_trading(cities: list[str], total_budget: float,
-                     per_city_budget: float, min_edge: float,
-                     logger: logging.Logger) -> list:
-    """Execute trades across cities. Returns list of trade results."""
+def _execute_trading(cities: list[str], max_spend: float,
+                     min_edge: float, logger: logging.Logger) -> list:
+    """
+    Execute one trading pass. SIZING_MODE in config.py selects:
+      "global"   — pooled cross-city sizing (default)
+      "per_city" — legacy even split, the proven-but-small Aug 18-31
+                   behavior (the one-line revert switch)
+    """
     from contextlib import redirect_stdout
-    from trader import run_trading_pipeline
+    from trader import run_global_pipeline
+
+    try:
+        from config import SIZING_MODE
+    except ImportError:
+        SIZING_MODE = "global"
+    if SIZING_MODE == "per_city":
+        return _execute_trading_per_city(cities, max_spend, min_edge, logger)
 
     total_results = []
-    total_spent = 0.0
+    logger.info(f"\n--- Trading {len(cities)} cities (global sizing) ---")
+    try:
+        with redirect_stdout(_LoggerWriter(logger)):
+            total_results = run_global_pipeline(
+                city_keys=cities,
+                dry_run=False,
+                min_edge=min_edge,
+                tomorrow_only=True,
+                max_spend=max_spend,
+            )
+        total_spent = sum(r.order.cost_dollars for r in total_results if r.success)
+        if total_spent:
+            logger.info(f"  Spent ${total_spent:.2f} this run")
 
-    for city in cities:
-        # Remaining budget shrinks as we spend
-        remaining = total_budget - total_spent
-        city_budget = min(per_city_budget, remaining)
-
-        if city_budget < 0.50:
-            logger.warning(f"  Skipping {city}: only ${remaining:.2f} remaining")
-            continue
-
-        logger.info(f"\n--- Trading {city.upper()} (budget: ${city_budget:.2f}) ---")
-        try:
-            # Capture trader.py's print() output into the daily log file
-            # so skip reasons are visible there, not just in stdout.
-            with redirect_stdout(_LoggerWriter(logger)):
-                results = run_trading_pipeline(
-                    city_key=city,
-                    dry_run=False,
-                    max_spend=city_budget,
-                    min_edge=min_edge,
-                    tomorrow_only=True,
-                )
-            total_results.extend(results)
-
-            # Track cumulative spending
-            city_spent = sum(r.order.cost_dollars for r in results if r.success)
-            total_spent += city_spent
-
-            # Safety: if any order fails, engage kill switch
-            failures = [r for r in results if not r.success]
-            if failures:
-                logger.error(f"  {len(failures)} order(s) FAILED for {city}")
-                for f in failures:
-                    logger.error(f"    {f.order.ticker}: {f.error}")
-
-                # Auto-kill on repeated failures
-                if len(failures) >= 3:
-                    engage_kill_switch(f"Auto-kill: {len(failures)} failures in {city}")
-                    logger.critical("AUTO KILL SWITCH engaged due to multiple failures")
-                    break
-
-        except Exception as e:
-            logger.error(f"  ERROR trading {city}: {e}")
-            # Don't auto-kill on single city errors — might be transient
+        failures = [r for r in total_results if not r.success]
+        if failures:
+            logger.error(f"  {len(failures)} order(s) FAILED")
+            for f in failures:
+                logger.error(f"    {f.order.ticker}: {f.error}")
+            if len(failures) >= 3:
+                engage_kill_switch(f"Auto-kill: {len(failures)} order failures")
+                logger.critical("AUTO KILL SWITCH engaged due to multiple failures")
+    except Exception as e:
+        logger.error(f"  ERROR in global trading pass: {e}")
 
     return total_results
 
 
-# ── Daemon mode ────────────────────────────────────────────────────
+
+def _execute_trading_per_city(cities: list[str], max_spend: float,
+                              min_edge: float, logger: logging.Logger) -> list:
+    """Legacy per-city budget split (pre-2026-09-01). Kept as the revert
+    path: proven Aug 18-31 live record, smaller bets."""
+    from contextlib import redirect_stdout
+    from trader import run_trading_pipeline
+    from kalshi_client import create_client_from_config
+
+    try:
+        from config import MAX_RUN_EXPOSURE_PCT as _pct
+    except ImportError:
+        _pct = 0.25
+    try:
+        client = create_client_from_config()
+        available = client.get_balance().get("balance", 0) / 100
+    except Exception as e:
+        logger.error(f"  Could not fetch balance for per-city split: {e}")
+        return []
+
+    total_budget = available * _pct
+    if max_spend is not None:
+        total_budget = min(total_budget, max_spend)
+    total_budget = min(total_budget, available)
+    per_city_budget = total_budget / len(cities)
+    logger.info(f"  [per_city mode] Budget: ${total_budget:.2f} total, "
+                f"${per_city_budget:.2f} per city")
+
+    total_results, total_spent = [], 0.0
+    for city in cities:
+        remaining = total_budget - total_spent
+        city_budget = min(per_city_budget, remaining)
+        if city_budget < 0.50:
+            logger.warning(f"  Skipping {city}: only ${remaining:.2f} remaining")
+            continue
+        logger.info(f"\n--- Trading {city.upper()} (budget: ${city_budget:.2f}) ---")
+        try:
+            with redirect_stdout(_LoggerWriter(logger)):
+                results = run_trading_pipeline(
+                    city_key=city, dry_run=False, max_spend=city_budget,
+                    min_edge=min_edge, tomorrow_only=True)
+            total_results.extend(results)
+            total_spent += sum(r.order.cost_dollars for r in results if r.success)
+            failures = [r for r in results if not r.success]
+            if failures:
+                logger.error(f"  {len(failures)} order(s) FAILED for {city}")
+                if len(failures) >= 3:
+                    engage_kill_switch(f"Auto-kill: {len(failures)} failures in {city}")
+                    logger.critical("AUTO KILL SWITCH engaged")
+                    break
+        except Exception as e:
+            logger.error(f"  ERROR trading {city}: {e}")
+    return total_results
+
 
 def run_daemon(run_hour: int = 7, cities: list[str] = None,
                max_spend: float = None):

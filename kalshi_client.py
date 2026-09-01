@@ -234,6 +234,10 @@ class KalshiClient:
             response = {"order": response, **response}
         return response
 
+    def get_order(self, order_id: str) -> dict:
+        """Get a single order — fill counts, actual costs and fees."""
+        return self._request("GET", f"/portfolio/orders/{order_id}", auth=True)
+
     def cancel_order(self, order_id: str) -> dict:
         """Cancel an open order (V2 endpoint)."""
         return self._request("DELETE", f"/portfolio/events/orders/{order_id}",
