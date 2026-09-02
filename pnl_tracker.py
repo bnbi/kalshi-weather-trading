@@ -30,13 +30,40 @@ DB_PATH = Path(__file__).parent / "kalshi_data.db"
 ERA_START_BANKROLL = 47.57
 
 
-def estimate_fee(contracts: int, price_cents: int) -> float:
-    """Kalshi trading fee: ceil_to_cent(0.07 * C * P * (1-P)), in dollars."""
-    import math
+def estimate_fee(contracts: float, price_cents: int) -> float:
+    """
+    Kalshi trading fee: 0.07 * C * P * (1-P), in dollars. Charged as the
+    exact fractional amount (the ledger shows $0.0294 for 2 @ 70¢), so no
+    rounding up — the old ceil-to-cent overstated fees by up to 35%.
+    """
     p = price_cents / 100.0
     if p <= 0 or p >= 1:
         return 0.0
-    return math.ceil(0.07 * contracts * p * (1 - p) * 100) / 100
+    return round(0.07 * contracts * p * (1 - p), 4)
+
+
+def open_exposure_dollars(conn: sqlite3.Connection = None) -> float:
+    """
+    Dollars currently committed to unsettled trades (at cost), from our own
+    ledger — both strategies log here, so this is the cross-strategy
+    exposure the total-exposure cap is measured against. Rows known to be
+    fully unfilled (filled_contracts = 0) are excluded.
+    """
+    close = conn is None
+    if conn is None:
+        conn = sqlite3.connect(str(DB_PATH))
+    try:
+        init_pnl_tables(conn)
+        row = conn.execute("""
+            SELECT COALESCE(SUM(cost_dollars), 0) FROM trades
+            WHERE settled = 0
+              AND (filled_contracts IS NULL OR filled_contracts > 0)
+              AND (order_id IS NULL OR order_id NOT LIKE 'DRY-%')
+        """).fetchone()
+        return float(row[0] or 0.0)
+    finally:
+        if close:
+            conn.close()
 
 
 # ── Database setup ─────────────────────────────────────────────────
@@ -114,19 +141,20 @@ def log_trade(conn: sqlite3.Connection, ticker: str, side: str, action: str,
               contracts: int, price_cents: int, cost_dollars: float,
               model_prob: float = None, edge: float = None,
               kelly_fraction: float = None, order_id: str = None,
-              fee_dollars: float = None):
-    """Log a trade when it's placed. fee_dollars: actual fee if known."""
+              fee_dollars: float = None, filled_contracts: float = None):
+    """Log a trade when it's placed. fee_dollars: actual fee if known.
+    filled_contracts: confirmed fill (None = not yet reconciled)."""
     now = datetime.now(timezone.utc).isoformat()
 
     conn.execute("""
         INSERT INTO trades (
             timestamp, ticker, side, action, contracts, price_cents,
             cost_dollars, model_prob, edge, kelly_fraction, order_id,
-            fee_dollars
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            fee_dollars, filled_contracts
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (now, ticker, side, action, contracts, price_cents,
           cost_dollars, model_prob, edge, kelly_fraction, order_id,
-          fee_dollars))
+          fee_dollars, filled_contracts))
     conn.commit()
 
 
@@ -137,7 +165,8 @@ def log_trade(conn: sqlite3.Connection, ticker: str, side: str, action: str,
 # when the market has moved AGAINST the model since the order was placed,
 # so the stale limit fills exactly when the thesis has gone bad. The saved
 # spread is captured on quick fills; anything older is pulled.
-STALE_ORDER_HOURS = 4
+STALE_ORDER_HOURS = 1   # backstop only: execute_orders now cancels unfilled
+                        # remainders within seconds of placement
 
 # Order states that mean the order is off the book (nothing to cancel).
 TERMINAL_ORDER_STATUSES = {"canceled", "cancelled", "executed", "expired"}
@@ -695,12 +724,19 @@ def print_calibration(conn: sqlite3.Connection, since: str = None) -> None:
 
 # ── Integration with trader.py ─────────────────────────────────────
 
-def log_trade_results(results: list, conn: sqlite3.Connection = None) -> None:
+def log_trade_results(results: list, conn: sqlite3.Connection = None) -> int:
     """
     Log trade results from trader.py's execute_orders().
     Call this after orders are placed.
 
-    results: list of TradeResult from trader.py
+    Records what actually FILLED: execute_orders cancels unfilled
+    remainders after a short wait and reports the true fill, so a trade
+    row reflects contracts held, not contracts requested. Orders with a
+    confirmed zero fill are not logged at all. When the fill is unknown
+    (fill check or cancel failed), the planned size is logged with
+    filled_contracts = NULL so reconcile_fills trues it up next run.
+
+    results: list of TradeResult from trader.py. Returns rows written.
     """
     if conn is None:
         conn = sqlite3.connect(str(DB_PATH))
@@ -710,27 +746,41 @@ def log_trade_results(results: list, conn: sqlite3.Connection = None) -> None:
         init_pnl_tables(conn)
         close_after = False
 
+    n = 0
     for r in results:
         if not r.success:
             continue
+        filled = getattr(r, "filled_contracts", None)
+        if filled is not None and filled <= 0:
+            continue  # confirmed no fill — nothing happened
+
+        contracts = r.order.contracts
+        cost = r.order.cost_dollars
+        if filled is not None:
+            contracts = int(round(filled))
+            fill_cost = getattr(r, "fill_cost_dollars", None)
+            cost = fill_cost if fill_cost else contracts * r.order.price_cents / 100
 
         log_trade(
             conn=conn,
             ticker=r.order.ticker,
             side=r.order.side,
             action=r.order.action,
-            contracts=r.order.contracts,
+            contracts=contracts,
             price_cents=r.order.price_cents,
-            cost_dollars=r.order.cost_dollars,
+            cost_dollars=cost,
             model_prob=r.order.signal.model_prob if r.order.signal else None,
             edge=r.order.edge,
             kelly_fraction=r.order.kelly_fraction,
             order_id=r.order_id,
             fee_dollars=getattr(r, "fee_dollars", None),
+            filled_contracts=filled,
         )
+        n += 1
 
     if close_after:
         conn.close()
+    return n
 
 
 # ── Counterfactual tracking of filtered signals ────────────────────

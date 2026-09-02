@@ -159,10 +159,10 @@ def _seed_predictions(rows):
     conn.execute("""
         CREATE TABLE daily_predictions (
             date TEXT, city TEXT, model_prediction_f REAL,
-            wk_forecast_f REAL, actual_high_f REAL)
+            wk_forecast_f REAL, actual_high_f REAL, actual_source TEXT)
     """)
     conn.executemany(
-        "INSERT INTO daily_predictions VALUES (?,?,?,?,?)",
+        "INSERT INTO daily_predictions VALUES (?,?,?,?,?,'station')",
         [(f"2026-01-{i % 28 + 1:02d}", "chicago", p, a, act)
          for i, (p, a, act) in enumerate(rows)])
     conn.commit()

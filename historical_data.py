@@ -9,13 +9,19 @@ APIs used:
 
 The output is a SQLite database with a clean table:
     date | actual_high | nws_forecast | gfs_forecast | ecmwf_forecast | blend_forecast | ...
+
+NOTE: the historical-forecast API serves SAME-DAY (lead-0) forecasts and the
+archive API serves ERA5 reanalysis "actuals". Rows written here are tagged
+source='archive', lead_ok=0, actual_source='era5' and are NOT used for
+training until backfill_lead1.py (lead-1 forecasts) and backfill_history.py
+(official GHCND actuals) have upgraded them. See db_migrations.py.
 """
 
-import requests
 import sqlite3
 import time
 from datetime import datetime, timedelta
 from weather import CITIES, City
+from http_util import get_with_retry
 
 OPEN_METEO_HEADERS = {
     "User-Agent": "(kalshi-weather-bot, github.com/bnbi/kalshi-weather-trading)",
@@ -49,11 +55,16 @@ def init_historical_tables(conn: sqlite3.Connection) -> None:
     # Add weather feature and extra-source columns if they don't exist yet.
     # icon_* is backfilled by backfill_history.py; wk_* (Apple WeatherKit)
     # accumulates live only — Apple publishes no forecast archive.
-    for col in ["wind_speed_max", "humidity_mean", "cloud_cover_mean",
-                "icon_forecast_f", "icon_error",
-                "wk_forecast_f", "wk_error"]:
+    for col in ["wind_speed_max REAL", "humidity_mean REAL", "cloud_cover_mean REAL",
+                "icon_forecast_f REAL", "icon_error REAL",
+                "wk_forecast_f REAL", "wk_error REAL",
+                # Provenance (see db_migrations.py): which pipeline wrote the
+                # row, its lead time, whether every source is lead-1, and
+                # whether the actual is the official GHCND value.
+                "source TEXT", "lead_days INTEGER", "lead_ok INTEGER",
+                "actual_source TEXT"]:
         try:
-            conn.execute(f"ALTER TABLE historical_forecasts ADD COLUMN {col} REAL")
+            conn.execute(f"ALTER TABLE historical_forecasts ADD COLUMN {col}")
             conn.commit()
         except Exception:
             pass  # column already exists
@@ -71,7 +82,7 @@ def fetch_actual_temps(city: City, start_date: str, end_date: str,
     if include_weather:
         daily_vars = "temperature_2m_max,wind_speed_10m_max,relative_humidity_2m_mean,cloud_cover_mean"
 
-    resp = requests.get("https://archive-api.open-meteo.com/v1/archive", params={
+    resp = get_with_retry("https://archive-api.open-meteo.com/v1/archive", params={
         "latitude": city.lat,
         "longitude": city.lon,
         "daily": daily_vars,
@@ -80,7 +91,6 @@ def fetch_actual_temps(city: City, start_date: str, end_date: str,
         "end_date": end_date,
         "timezone": city.timezone,
     }, headers=OPEN_METEO_HEADERS, timeout=30)
-    resp.raise_for_status()
     data = resp.json()
 
     daily = data.get("daily", {})
@@ -130,8 +140,7 @@ def fetch_historical_forecasts(city: City, start_date: str, end_date: str,
     if model_name:
         params["models"] = model_name
 
-    resp = requests.get(url, params=params, headers=OPEN_METEO_HEADERS, timeout=30)
-    resp.raise_for_status()
+    resp = get_with_retry(url, params=params, headers=OPEN_METEO_HEADERS, timeout=30)
     data = resp.json()
 
     daily = data.get("daily", {})
@@ -225,14 +234,23 @@ def fetch_all_historical(city_key: str, start_date: str, end_date: str,
             humidity = wx.get("humidity") if isinstance(wx, dict) else None
             cloud = wx.get("cloud") if isinstance(wx, dict) else None
 
+            # Never clobber a live-collected row: the live feed is the
+            # serving distribution and is the training anchor for its dates.
+            live = conn.execute(
+                "SELECT 1 FROM historical_forecasts WHERE date = ? AND city = ? "
+                "AND source = 'live'", (date_str, city_key)).fetchone()
+            if live:
+                continue
+
             conn.execute("""
                 INSERT OR REPLACE INTO historical_forecasts (
                     date, city, actual_high_f,
                     gfs_forecast_f, ecmwf_forecast_f, blend_forecast_f,
                     gfs_error, ecmwf_error, blend_error,
                     month, day_of_year, model_spread,
-                    wind_speed_max, humidity_mean, cloud_cover_mean
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    wind_speed_max, humidity_mean, cloud_cover_mean,
+                    source, lead_ok, actual_source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'archive', 0, 'era5')
             """, (
                 date_str,
                 city_key,

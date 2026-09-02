@@ -33,9 +33,8 @@ from train_model import get_model_path
 
 BOT_DIR = Path(__file__).parent
 DB_PATH = BOT_DIR / "kalshi_data.db"
-STATIC_DIR = BOT_DIR / "dashboard_static"
 
-app = Flask(__name__, static_folder=str(STATIC_DIR))
+app = Flask(__name__, static_folder=None)  # the single-page UI is served from BOT_DIR
 
 
 # ── Helpers ───────────────────────────────────────────────────────
@@ -44,6 +43,11 @@ def get_db():
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     init_pnl_tables(conn)
+    try:
+        from db_migrations import migrate_db
+        migrate_db(conn)
+    except Exception:
+        pass
     return conn
 
 
@@ -151,7 +155,21 @@ def api_positions():
         client = create_client_from_config()
         resp = client.get_positions(limit=200)
         positions = resp.get("market_positions", [])
-        active = [p for p in positions if position_size(p) > 0]
+        active = []
+        for p in positions:
+            qty = position_size(p)
+            if qty <= 0:
+                continue
+            # position_fp is signed: + = YES, - = NO (legacy yes_count/no_count)
+            raw = p.get("position_fp", p.get("position"))
+            try:
+                side = "yes" if float(raw) > 0 else "no"
+            except (TypeError, ValueError):
+                side = "yes" if (p.get("yes_count") or 0) > 0 else "no"
+            row = dict(p)
+            row["side"] = side
+            row["qty"] = qty
+            active.append(row)
         return jsonify(active)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -383,6 +401,9 @@ def api_model_health():
                 "trained_date": data.get("trained_date"),
                 "feature_names": data.get("feature_names", []),
                 "baseline_mae": round(data.get("baseline_mae", 0), 2),
+                "train_range": f"{data.get('train_start', '?')} → {data.get('train_end', '?')}",
+                "sigma_model": data.get("sigma_model") is not None,
+                "excluded_sources": data.get("excluded_sources", []),
             }
 
             # Feature importances (GradientBoosting) or coefficients (Ridge)
@@ -403,7 +424,8 @@ def api_model_health():
     tracking = {}
     for city_key in CITIES:
         rows = conn.execute("""
-            SELECT date, model_error, gfs_error, ecmwf_error, blend_error
+            SELECT date, model_error, gfs_error, ecmwf_error, blend_error,
+                   actual_source
             FROM daily_predictions
             WHERE city = ? AND actual_high_f IS NOT NULL
             ORDER BY date
@@ -416,13 +438,15 @@ def api_model_health():
                 "gfs_error": r["gfs_error"],
                 "ecmwf_error": r["ecmwf_error"],
                 "blend_error": r["blend_error"],
+                "truth": r["actual_source"] or "legacy",
             } for r in rows]
 
     # Training data size
     data_size = {}
     for city_key in CITIES:
         row = conn.execute(
-            "SELECT COUNT(*) as cnt FROM historical_forecasts WHERE city = ?",
+            "SELECT COUNT(*) as cnt FROM historical_forecasts WHERE city = ? "
+            "AND lead_ok = 1 AND actual_source = 'station'",
             (city_key,)
         ).fetchone()
         data_size[city_key] = row["cnt"] if row else 0

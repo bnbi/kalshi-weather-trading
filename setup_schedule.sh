@@ -4,7 +4,7 @@
 #
 # Why launchd instead of cron?
 # - launchd is macOS-native and doesn't need Full Disk Access permissions
-# - If your Mac is asleep at 7am, launchd runs the job as soon as it wakes up
+# - If your Mac is asleep at the scheduled hour, launchd runs the job as soon as it wakes up
 # - No need for pmset hacks or keeping the lid open
 
 set -e
@@ -81,7 +81,8 @@ else
 fi
 
 echo ""
-echo "The bot will now run every day at 10:00 AM (see StartCalendarInterval)."
+echo "The bot will now run every day at 13:00 local (see StartCalendarInterval;"
+echo "keep config.RUN_HOUR equal to it)."
 echo "If your Mac is asleep then, it will run as soon as you open the lid."
 echo ""
 echo "Useful commands:"

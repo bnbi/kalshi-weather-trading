@@ -8,14 +8,26 @@ Kalshi settlement stations:
     chicago -> Chicago Midway Airport   (NWS: KMDW, GHCND: USW00014819)
     nyc     -> Central Park             (NWS: KNYC, GHCND: USW00094728)
     miami   -> Miami Intl Airport       (NWS: KMIA, GHCND: USW00012839)
+    denver  -> Denver Intl Airport      (NWS: KDEN, GHCND: USW00003017)
+    austin  -> Austin-Bergstrom Intl    (NWS: KAUS, GHCND: USW00013904)
+    la      -> Los Angeles Intl         (NWS: KLAX, GHCND: USW00023174)
+    philly  -> Philadelphia Intl        (NWS: KPHL, GHCND: USW00013739)
 
 Two sources, in order of preference:
     1. NOAA NCEI GHCND daily summaries — the official climate record
        (same numbers as the NWS climate report Kalshi settles on).
-       Lags 1-3 days behind real time.
+       Lags 1-3 days behind real time.  -> source 'station'
     2. NWS observations API — near-real-time station obs; we take the max
        over the local calendar day. Used for recent dates GHCND doesn't
-       have yet.
+       have yet.                                 -> source 'feed'
+
+IMPORTANT: the feed max is NOT the settlement number. Measured on 85 days
+(Jul-Aug 2026) the rounded feed differed from the official GHCND value on
+41% of days (NYC 58%, Denver 6/7), with per-city biases up to -1.4°F: hourly
+sampling misses the true peak, and many hours arrive as whole °C (1.8°F
+steps). Feed values are therefore PROVISIONAL and are replaced by GHCND when
+it arrives (daily_learner.reverify_provisional). Nothing that grades money
+(live calibration, sniper gate, training targets) should use a feed value.
 """
 
 from __future__ import annotations
@@ -30,6 +42,7 @@ except ImportError:  # pragma: no cover
     ZoneInfo = None
 
 from weather import CITIES
+from http_util import get_with_retry
 
 NCEI_URL = "https://www.ncei.noaa.gov/access/services/data/v1"
 NWS_BASE = "https://api.weather.gov"
@@ -46,6 +59,9 @@ STATIONS = {
     "philly": {"nws": "KPHL", "ghcnd": "USW00013739"},   # Philadelphia Intl
 }
 
+SOURCE_OFFICIAL = "station"   # NOAA GHCND — what Kalshi settles on
+SOURCE_FEED = "feed"          # NWS obs feed max — provisional only
+
 
 def fetch_ghcnd_daily_highs(city_key: str, start_date: str,
                             end_date: str) -> dict:
@@ -56,7 +72,7 @@ def fetch_ghcnd_daily_highs(city_key: str, start_date: str,
     (GHCND typically lags 1-3 days behind real time).
     """
     station = STATIONS[city_key]["ghcnd"]
-    resp = requests.get(NCEI_URL, params={
+    resp = get_with_retry(NCEI_URL, params={
         "dataset": "daily-summaries",
         "stations": station,
         "startDate": start_date,
@@ -64,8 +80,7 @@ def fetch_ghcnd_daily_highs(city_key: str, start_date: str,
         "dataTypes": "TMAX",
         "format": "json",
         "units": "standard",  # Fahrenheit
-    }, headers=HEADERS, timeout=60)
-    resp.raise_for_status()
+    }, headers=HEADERS, timeout=45, retries=2)
 
     highs = {}
     for row in resp.json():
@@ -85,7 +100,7 @@ def fetch_nws_station_high(city_key: str, date: str) -> float | None:
     calendar day. Near-real-time; available within hours of midnight.
 
     Returns the max observed temperature in °F, or None if there are
-    too few observations to trust (< 12 hourly obs).
+    too few observations to trust (< 12 obs). PROVISIONAL — see module doc.
     """
     station = STATIONS[city_key]["nws"]
     city = CITIES[city_key]
@@ -97,7 +112,7 @@ def fetch_nws_station_high(city_key: str, date: str) -> float | None:
         day_start = datetime.strptime(date, "%Y-%m-%d")
     day_end = day_start + timedelta(days=1)
 
-    resp = requests.get(
+    resp = get_with_retry(
         f"{NWS_BASE}/stations/{station}/observations",
         params={
             "start": day_start.isoformat(),
@@ -107,7 +122,6 @@ def fetch_nws_station_high(city_key: str, date: str) -> float | None:
         headers={**HEADERS, "Accept": "application/geo+json"},
         timeout=30,
     )
-    resp.raise_for_status()
 
     temps_c = []
     for feature in resp.json().get("features", []):
@@ -138,12 +152,11 @@ def get_observed_max(city_key: str, local_date: str) -> dict | None:
     start = midnight_local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     try:
-        resp = requests.get(
+        resp = get_with_retry(
             f"{NWS_BASE}/stations/{station}/observations",
-            params={"start": start, "limit": 200},
+            params={"start": start, "limit": 500},
             headers={**HEADERS, "Accept": "application/geo+json"},
-            timeout=15)
-        resp.raise_for_status()
+            timeout=15, retries=2)
         features = resp.json().get("features", [])
     except Exception as e:
         print(f"  [{city_key}] obs fetch failed: {e}")
@@ -170,20 +183,33 @@ def get_observed_max(city_key: str, local_date: str) -> dict | None:
     return {"obs_max_f": max(temps_f), "n_obs": len(temps_f), "last_obs": last_obs}
 
 
-def fetch_station_daily_high(city_key: str, date: str) -> float | None:
+def fetch_station_daily_high_with_source(city_key: str,
+                                         date: str) -> tuple[float | None, str | None]:
     """
-    Get the settlement-station daily high for one date.
-    Tries the official GHCND record first, then near-real-time NWS obs.
+    (daily high °F, source) for one date: ('station' = official GHCND,
+    'feed' = provisional NWS obs max), or (None, None) if neither is available.
     """
     try:
         highs = fetch_ghcnd_daily_highs(city_key, date, date)
         if date in highs:
-            return highs[date]
+            return highs[date], SOURCE_OFFICIAL
     except Exception as e:
         print(f"    GHCND lookup failed for {city_key} {date}: {e}")
 
     try:
-        return fetch_nws_station_high(city_key, date)
+        high = fetch_nws_station_high(city_key, date)
+        if high is not None:
+            return high, SOURCE_FEED
     except Exception as e:
         print(f"    NWS obs lookup failed for {city_key} {date}: {e}")
-        return None
+    return None, None
+
+
+def fetch_station_daily_high(city_key: str, date: str) -> float | None:
+    """
+    Get the settlement-station daily high for one date (value only).
+    Tries the official GHCND record first, then near-real-time NWS obs.
+    Prefer fetch_station_daily_high_with_source when the caller must know
+    whether the number is official or provisional.
+    """
+    return fetch_station_daily_high_with_source(city_key, date)[0]

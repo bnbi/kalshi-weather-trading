@@ -19,16 +19,19 @@ from datetime import datetime, timedelta
 from weather import CITIES
 from historical_data import fetch_all_historical, print_data_summary, init_historical_tables
 from train_model import train_and_evaluate, get_model_path
+from db_migrations import migrate_db
 
 from pathlib import Path
 DB_PATH = str(Path(__file__).parent / "kalshi_data.db")
 
 
 def check_data_available(conn: sqlite3.Connection, city: str) -> int:
-    """Check how many days of historical data we have for a city."""
+    """Training-clean days (lead-1 forecasts, official truth) for a city."""
     init_historical_tables(conn)
+    migrate_db(conn)
     row = conn.execute(
-        "SELECT COUNT(*) FROM historical_forecasts WHERE city = ?", (city,)
+        "SELECT COUNT(*) FROM historical_forecasts WHERE city = ? "
+        "AND lead_ok = 1 AND actual_source = 'station'", (city,)
     ).fetchone()
     return row[0] if row else 0
 
@@ -51,8 +54,8 @@ def train_city(conn: sqlite3.Connection, city: str):
 
     days = check_data_available(conn, city)
     if days < 30:
-        print(f"  ERROR: Only {days} days of data for {city}. Need at least 30.")
-        print(f"  Run with --fetch to pull historical data first.")
+        print(f"  ERROR: Only {days} training-clean days for {city}. Need at least 30.")
+        print(f"  Run backfill_history.py (lead-1 forecasts + official GHCND truth).")
         return False
 
     print(f"  Data available: {days} days")
@@ -92,6 +95,8 @@ def main():
 
         if args.fetch or days < 30:
             fetch_data_for_city(conn, city, args.start)
+            print("  NOTE: raw archive rows are lead-0 / ERA5 and are not training-clean "
+                  "until backfill_history.py has upgraded them.")
 
     # Step 2: Train models
     print(f"\n\n{'#' * 60}")

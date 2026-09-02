@@ -1,20 +1,25 @@
 """
 Daily Self-Training Pipeline
-Each morning, this module:
-    1. Records what each model predicted for today (saved for tomorrow's comparison)
-    2. Fetches yesterday's actual high temperature
-    3. Compares yesterday's predictions to reality
-    4. Appends the new data point to the training set
-    5. Retrains the model with the expanded dataset
+Each run, this module:
+    1. Re-verifies provisional actuals (NWS obs feed / ERA5) against the
+       official NOAA GHCND record as it arrives (1-3 day lag)
+    2. Verifies recent unverified days (official if available, else the
+       provisional feed max, clearly labelled as such)
+    3. Syncs official, lead-1 days into the training set
+    4. Retrains the per-city models on the expanded dataset
+    5. Records what each source (and the model) predicts for today/tomorrow
 
-The model continuously improves as it accumulates more data and adapts to
-seasonal patterns in real time.
+Ground truth policy (the part that used to be wrong): only a GHCND value is
+the settlement number. The NWS obs feed max differed from it on ~40% of days
+and by up to -1.4°F on average per city, so feed values are stored with
+actual_source='feed', kept OUT of training / live calibration / the sniper
+gate, and replaced once GHCND publishes.
 
 Usage:
     python daily_learner.py                # run full daily cycle (all cities)
     python daily_learner.py --city chicago # single city
     python daily_learner.py record         # just record today's forecasts
-    python daily_learner.py learn          # just learn from yesterday
+    python daily_learner.py learn          # just verify/re-verify and retrain
     python daily_learner.py stats          # show learning stats
 """
 
@@ -24,11 +29,15 @@ import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from weather import CITIES
 from historical_data import init_historical_tables, fetch_actual_temps
 from train_model import train_and_evaluate, get_model_path
-from weather_ensemble import fetch_open_meteo_forecast
+from weather_ensemble import fetch_open_meteo_forecast, ml_predict_for
+from db_migrations import migrate_db, sync_training_row, lead_days_for
+from station_obs import (fetch_station_daily_high_with_source,
+                         fetch_ghcnd_daily_highs, SOURCE_OFFICIAL, SOURCE_FEED)
 import weatherkit
 
 BOT_DIR = Path(__file__).parent
@@ -36,6 +45,15 @@ DB_PATH = BOT_DIR / "kalshi_data.db"
 
 # How many recent unverified days each learning cycle tries to catch up on.
 VERIFY_LOOKBACK_DAYS = 7
+
+# Provisional (feed/ERA5/unknown-source) rows are re-checked against GHCND
+# for this long. GHCND normally lands within 3 days; the long window also
+# lets the first run after this change correct months of legacy rows.
+REVERIFY_LOOKBACK_DAYS = 400
+
+
+def _local_today(city_key: str) -> str:
+    return datetime.now(ZoneInfo(CITIES[city_key].timezone)).strftime("%Y-%m-%d")
 
 
 # ── Database setup ─────────────────────────────────────────────────
@@ -62,15 +80,16 @@ def init_prediction_log(conn: sqlite3.Connection) -> None:
     """)
     conn.commit()
 
-    # Extra forecast sources added after the table was first created.
-    # ICON was previously only backfilled into historical_forecasts, so
-    # live-collected rows lost it; both are now logged here every run.
+    # Extra columns added after the table was first created.
     for col in ["icon_forecast_f REAL", "icon_error REAL",
                 "wk_forecast_f REAL", "wk_error REAL",
-                # Where actual_high_f came from: 'station' (settlement truth)
-                # or 'era5' (reanalysis fallback, can differ by 1-3°F).
-                # The sniper's validation gate only trusts station rows.
-                "actual_source TEXT"]:
+                # Where actual_high_f came from: 'station' (GHCND, the
+                # settlement number), 'feed' (NWS obs max, provisional) or
+                # 'era5' (reanalysis fallback). Only 'station' rows may
+                # feed training, live calibration or the sniper gate.
+                "actual_source TEXT",
+                # Days between the recording date and the target date.
+                "lead_days INTEGER"]:
         try:
             conn.execute(f"ALTER TABLE daily_predictions ADD COLUMN {col}")
             conn.commit()
@@ -89,7 +108,7 @@ def record_forecasts(conn: sqlite3.Connection, city_key: str,
     city = CITIES[city_key]
 
     if target_date is None:
-        target_date = datetime.now().strftime("%Y-%m-%d")
+        target_date = _local_today(city_key)
 
     # Check if already recorded
     existing = conn.execute(
@@ -149,42 +168,59 @@ def record_forecasts(conn: sqlite3.Connection, city_key: str,
         print(f"    No forecasts available — skipping")
         return
 
-    # Get trained model prediction if available
+    # Trained-model prediction on the SAME inputs and features the live
+    # pipeline uses (exclusions, imputation, weather + trend features).
     model_pred = None
-    if all(v is not None for v in [gfs, ecmwf, blend]):
-        try:
-            from train_model import predict_with_trained_model
-            model_path = str(BOT_DIR / get_model_path(city_key))
-            dt = datetime.strptime(target_date, "%Y-%m-%d")
-            result = predict_with_trained_model(
-                gfs=gfs, ecmwf=ecmwf, blend=blend, icon=icon,
-                weatherkit=wk,   # keep this recorded prediction on the same
-                                 # inputs the live pipeline uses
-                month=dt.month,
-                day_of_year=dt.timetuple().tm_yday,
-                model_path=model_path,
-            )
+    try:
+        result = ml_predict_for(city_key, target_date, gfs, ecmwf, blend,
+                                icon=icon, wk=wk)
+        if result is not None:
             model_pred = result["predicted_high"]
-        except Exception as e:
-            print(f"    Trained model prediction failed: {e}")
+    except Exception as e:
+        print(f"    Trained model prediction failed: {e}")
 
     now = datetime.now(timezone.utc).isoformat()
+    lead = lead_days_for(target_date, now, city.timezone)
     conn.execute("""
         INSERT OR IGNORE INTO daily_predictions (
             date, city, gfs_forecast_f, ecmwf_forecast_f, blend_forecast_f,
-            icon_forecast_f, wk_forecast_f, model_prediction_f, recorded_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (target_date, city_key, gfs, ecmwf, blend, icon, wk, model_pred, now))
+            icon_forecast_f, wk_forecast_f, model_prediction_f, recorded_at,
+            lead_days
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (target_date, city_key, gfs, ecmwf, blend, icon, wk, model_pred, now, lead))
     conn.commit()
 
     forecasts_str = f"GFS={gfs}, ECMWF={ecmwf}, Blend={blend}, ICON={icon}"
     if wk is not None:
         forecasts_str += f", Apple={wk}"
     model_str = f", Model={model_pred}" if model_pred else ""
-    print(f"    Recorded: {forecasts_str}{model_str}")
+    print(f"    Recorded (lead {lead}d): {forecasts_str}{model_str}")
 
 
-# ── Step 2: Verify yesterday's predictions ─────────────────────────
+# ── Step 2: Verify past predictions ────────────────────────────────
+
+def _write_verification(conn: sqlite3.Connection, city_key: str, check_date: str,
+                        actual: float, source: str) -> None:
+    row = conn.execute("""
+        SELECT gfs_forecast_f, ecmwf_forecast_f, blend_forecast_f,
+               model_prediction_f, icon_forecast_f, wk_forecast_f
+        FROM daily_predictions WHERE date = ? AND city = ?
+    """, (check_date, city_key)).fetchone()
+    if row is None:
+        return
+    gfs, ecmwf, blend, model_pred, icon, wk = row
+    err = lambda v: (v - actual) if v is not None else None
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("""
+        UPDATE daily_predictions SET
+            actual_high_f = ?, actual_source = ?,
+            model_error = ?, gfs_error = ?, ecmwf_error = ?, blend_error = ?,
+            icon_error = ?, wk_error = ?, verified_at = ?
+        WHERE date = ? AND city = ?
+    """, (actual, source, err(model_pred), err(gfs), err(ecmwf), err(blend),
+          err(icon), err(wk), now, check_date, city_key))
+    conn.commit()
+
 
 def verify_yesterday(conn: sqlite3.Connection, city_key: str,
                      check_date: str = None) -> dict | None:
@@ -192,16 +228,15 @@ def verify_yesterday(conn: sqlite3.Connection, city_key: str,
     Fetch the actual high for a past date and compare to predictions.
     Returns the verification result or None if not available.
     """
-    city = CITIES[city_key]
-
     if check_date is None:
-        check_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        check_date = (datetime.now(ZoneInfo(CITIES[city_key].timezone))
+                      - timedelta(days=1)).strftime("%Y-%m-%d")
 
     # Check if we have a prediction to verify
     row = conn.execute("""
         SELECT gfs_forecast_f, ecmwf_forecast_f, blend_forecast_f,
                model_prediction_f, actual_high_f,
-               icon_forecast_f, wk_forecast_f
+               icon_forecast_f, wk_forecast_f, actual_source
         FROM daily_predictions
         WHERE date = ? AND city = ?
     """, (check_date, city_key)).fetchone()
@@ -211,34 +246,35 @@ def verify_yesterday(conn: sqlite3.Connection, city_key: str,
         return None
 
     if row[4] is not None:
-        print(f"  [{city_key}] Already verified {check_date} (actual={row[4]}°F)")
-        return {"actual": row[4], "already_done": True}
+        print(f"  [{city_key}] Already verified {check_date} "
+              f"(actual={row[4]}°F, source={row[7] or 'unknown'})")
+        return {"actual": row[4], "already_done": True, "source": row[7]}
 
     gfs, ecmwf, blend, model_pred = row[0], row[1], row[2], row[3]
     icon, wk = row[5], row[6]
 
-    # Fetch actual temperature — settlement-station truth first (this is
-    # the number Kalshi settles on), ERA5 reanalysis only as a fallback.
+    # Fetch actual temperature — official settlement-station truth first,
+    # then the provisional obs feed, ERA5 reanalysis only as a last resort.
     print(f"  [{city_key}] Fetching actual high for {check_date}...")
-    actual = None
-    actual_source = None
+    actual, actual_source = None, None
     try:
-        from station_obs import fetch_station_daily_high
-        actual = fetch_station_daily_high(city_key, check_date)
+        actual, actual_source = fetch_station_daily_high_with_source(city_key, check_date)
         if actual is not None:
-            actual_source = "station"
-            print(f"    (official station reading)")
+            label = ("official station reading" if actual_source == SOURCE_OFFICIAL
+                     else "PROVISIONAL obs-feed max — will be re-verified against GHCND")
+            print(f"    ({label})")
     except Exception as e:
         print(f"    Station obs failed: {e}")
 
     if actual is None:
         try:
+            city = CITIES[city_key]
             actuals = fetch_actual_temps(city, check_date, check_date)
             actual = actuals.get(check_date)
             if actual is not None:
                 actual_source = "era5"
                 print(f"    WARNING: using ERA5 fallback — may differ "
-                      f"from settlement station")
+                      f"from settlement station; will be re-verified")
         except Exception as e:
             print(f"    Could not fetch actual temp: {e}")
             return None
@@ -247,134 +283,120 @@ def verify_yesterday(conn: sqlite3.Connection, city_key: str,
         print(f"    Actual temp not yet available for {check_date}")
         return None
 
-    # Compute errors
-    gfs_err = (gfs - actual) if gfs is not None else None
-    ecmwf_err = (ecmwf - actual) if ecmwf is not None else None
-    blend_err = (blend - actual) if blend is not None else None
-    model_err = (model_pred - actual) if model_pred is not None else None
-    icon_err = (icon - actual) if icon is not None else None
-    wk_err = (wk - actual) if wk is not None else None
+    _write_verification(conn, city_key, check_date, actual, actual_source)
 
-    now = datetime.now(timezone.utc).isoformat()
-    conn.execute("""
-        UPDATE daily_predictions SET
-            actual_high_f = ?,
-            actual_source = ?,
-            model_error = ?,
-            gfs_error = ?,
-            ecmwf_error = ?,
-            blend_error = ?,
-            icon_error = ?,
-            wk_error = ?,
-            verified_at = ?
-        WHERE date = ? AND city = ?
-    """, (actual, actual_source, model_err, gfs_err, ecmwf_err, blend_err,
-          icon_err, wk_err, now, check_date, city_key))
-    conn.commit()
-
-    print(f"    Actual: {actual}°F")
-    if gfs is not None:
-        print(f"    GFS:    {gfs}°F (error: {gfs_err:+.1f}°F)")
-    if ecmwf is not None:
-        print(f"    ECMWF:  {ecmwf}°F (error: {ecmwf_err:+.1f}°F)")
-    if blend is not None:
-        print(f"    Blend:  {blend}°F (error: {blend_err:+.1f}°F)")
-    if icon is not None:
-        print(f"    ICON:   {icon}°F (error: {icon_err:+.1f}°F)")
-    if wk is not None:
-        print(f"    Apple:  {wk}°F (error: {wk_err:+.1f}°F)")
-    if model_pred is not None:
-        print(f"    Model:  {model_pred}°F (error: {model_err:+.1f}°F)")
+    print(f"    Actual: {actual}°F [{actual_source}]")
+    for name, val in (("GFS", gfs), ("ECMWF", ecmwf), ("Blend", blend),
+                      ("ICON", icon), ("Apple", wk), ("Model", model_pred)):
+        if val is not None:
+            print(f"    {name:<6} {val}°F (error: {val - actual:+.1f}°F)")
 
     return {
         "date": check_date,
         "city": city_key,
         "actual": actual,
-        "model_error": model_err,
-        "gfs_error": gfs_err,
+        "source": actual_source,
+        "model_error": (model_pred - actual) if model_pred is not None else None,
+        "gfs_error": (gfs - actual) if gfs is not None else None,
     }
+
+
+def reverify_provisional(conn: sqlite3.Connection, city_key: str,
+                         lookback_days: int = REVERIFY_LOOKBACK_DAYS) -> int:
+    """
+    Replace provisional actuals (feed / ERA5 / unknown-source legacy rows)
+    with the official GHCND value wherever it is now available, recompute
+    the error columns, and re-sync the training row. One NCEI call per city.
+    Returns the number of rows corrected.
+    """
+    today = _local_today(city_key)
+    floor = (datetime.strptime(today, "%Y-%m-%d")
+             - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+    rows = conn.execute("""
+        SELECT date, actual_high_f FROM daily_predictions
+        WHERE city = ? AND actual_high_f IS NOT NULL
+          AND (actual_source IS NULL OR actual_source != 'station')
+          AND date >= ? AND date < ?
+        ORDER BY date
+    """, (city_key, floor, today)).fetchall()
+    if not rows:
+        return 0
+
+    start, end = rows[0][0], rows[-1][0]
+    try:
+        official = fetch_ghcnd_daily_highs(city_key, start, end)
+    except Exception as e:
+        print(f"  [{city_key}] GHCND re-verification fetch failed: {e}")
+        return 0
+
+    fixed = 0
+    changed = []
+    for date, provisional in rows:
+        truth = official.get(date)
+        if truth is None:
+            continue  # GHCND hasn't published this day yet — try next run
+        _write_verification(conn, city_key, date, truth, SOURCE_OFFICIAL)
+        sync_training_row(conn, city_key, date)
+        fixed += 1
+        if provisional is not None and round(provisional) != round(truth):
+            changed.append((date, provisional, truth))
+
+    if fixed:
+        print(f"  [{city_key}] Re-verified {fixed} provisional day(s) against GHCND"
+              + (f"; settlement value changed on {len(changed)}: "
+                 + ", ".join(f"{d} {p:.1f}->{t:.0f}" for d, p, t in changed[:6])
+                 + (" ..." if len(changed) > 6 else "") if changed else ""))
+    return fixed
 
 
 # ── Step 3: Add to training set ────────────────────────────────────
 
 def add_to_training_data(conn: sqlite3.Connection, city_key: str,
-                          check_date: str = None):
+                          check_date: str = None) -> bool:
     """
-    Add a verified prediction to the historical_forecasts table
-    so it's included in future model training.
-    Also fetches weather features (wind, humidity, cloud cover) for the date.
+    Sync a verified day into historical_forecasts for future training.
+    Only OFFICIAL (station) truth at lead >= 1 is admitted — see
+    db_migrations.sync_training_row. Weather features (wind, humidity,
+    cloud) are fetched from the archive API on first insert.
     """
     if check_date is None:
-        check_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        check_date = (datetime.now(ZoneInfo(CITIES[city_key].timezone))
+                      - timedelta(days=1)).strftime("%Y-%m-%d")
 
-    # Get the verified prediction
     row = conn.execute("""
-        SELECT gfs_forecast_f, ecmwf_forecast_f, blend_forecast_f, actual_high_f,
-               icon_forecast_f, wk_forecast_f
-        FROM daily_predictions
+        SELECT actual_source, lead_days FROM daily_predictions
         WHERE date = ? AND city = ? AND actual_high_f IS NOT NULL
     """, (check_date, city_key)).fetchone()
-
-    if row is None:
+    if row is None or row[0] != SOURCE_OFFICIAL:
+        return False
+    if row[1] is not None and row[1] < 1:
+        print(f"  [{city_key}] {check_date} was recorded on the day itself "
+              f"(lead 0) — kept out of the training set")
         return False
 
-    gfs, ecmwf, blend, actual, icon, wk = row
-
-    # Check if already in historical_forecasts
     existing = conn.execute(
         "SELECT 1 FROM historical_forecasts WHERE date = ? AND city = ?",
-        (check_date, city_key)
-    ).fetchone()
+        (check_date, city_key)).fetchone()
 
-    if existing:
-        return False
-
-    dt = datetime.strptime(check_date, "%Y-%m-%d")
-    available = [v for v in [gfs, ecmwf, blend] if v is not None]
-    spread = (max(available) - min(available)) if len(available) > 1 else 0
-
-    # Fetch weather features for this date
-    wind, humidity, cloud = None, None, None
-    try:
-        city = CITIES[city_key]
-        weather = fetch_actual_temps(city, check_date, check_date, include_weather=True)
-        wx = weather.get(check_date, {})
-        if isinstance(wx, dict):
-            wind = wx.get("wind")
-            humidity = wx.get("humidity")
-            cloud = wx.get("cloud")
-            if any(v is not None for v in [wind, humidity, cloud]):
-                print(f"    Weather: wind={wind}, humidity={humidity}, cloud={cloud}")
-    except Exception as e:
-        print(f"    Could not fetch weather features: {e}")
+    weather = None
+    if not existing:
+        try:
+            city = CITIES[city_key]
+            wx_all = fetch_actual_temps(city, check_date, check_date, include_weather=True)
+            wx = wx_all.get(check_date, {})
+            if isinstance(wx, dict):
+                weather = {"wind": wx.get("wind"), "humidity": wx.get("humidity"),
+                           "cloud": wx.get("cloud")}
+                print(f"    Weather: wind={weather['wind']}, "
+                      f"humidity={weather['humidity']}, cloud={weather['cloud']}")
+        except Exception as e:
+            print(f"    Could not fetch weather features: {e}")
 
     init_historical_tables(conn)
-    conn.execute("""
-        INSERT OR REPLACE INTO historical_forecasts (
-            date, city, actual_high_f,
-            gfs_forecast_f, ecmwf_forecast_f, blend_forecast_f,
-            gfs_error, ecmwf_error, blend_error,
-            month, day_of_year, model_spread,
-            wind_speed_max, humidity_mean, cloud_cover_mean,
-            icon_forecast_f, icon_error, wk_forecast_f, wk_error
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        check_date, city_key, actual,
-        gfs, ecmwf, blend,
-        (gfs - actual) if gfs is not None else None,
-        (ecmwf - actual) if ecmwf is not None else None,
-        (blend - actual) if blend is not None else None,
-        dt.month,
-        dt.timetuple().tm_yday,
-        spread,
-        wind, humidity, cloud,
-        icon, (icon - actual) if icon is not None else None,
-        wk, (wk - actual) if wk is not None else None,
-    ))
-    conn.commit()
-
-    print(f"  [{city_key}] Added {check_date} to training data")
-    return True
+    written = sync_training_row(conn, city_key, check_date, weather=weather)
+    if written and not existing:
+        print(f"  [{city_key}] Added {check_date} to training data")
+    return written and not existing
 
 
 # ── Step 4: Retrain ────────────────────────────────────────────────
@@ -382,51 +404,48 @@ def add_to_training_data(conn: sqlite3.Connection, city_key: str,
 def retrain_model(conn: sqlite3.Connection, city_key: str) -> bool:
     """Retrain the model with the expanded dataset."""
     count = conn.execute(
-        "SELECT COUNT(*) FROM historical_forecasts WHERE city = ?",
+        "SELECT COUNT(*) FROM historical_forecasts WHERE city = ? "
+        "AND lead_ok = 1 AND actual_source = 'station'",
         (city_key,)
     ).fetchone()[0]
 
-    print(f"  [{city_key}] Retraining on {count} days of data...")
+    print(f"  [{city_key}] Retraining on {count} clean days of data...")
 
     try:
         model_data = train_and_evaluate(city_key, conn)
         print(f"  [{city_key}] New MAE: {model_data['train_mae']:.2f}°F "
-              f"(σ={model_data['residual_std']:.2f}°F)")
+              f"(σ={model_data['residual_std']:.2f}°F, "
+              f"{model_data['model_name']}, "
+              f"day-σ {'on' if model_data['sigma_model'] is not None else 'off'})")
         return True
     except Exception as e:
         print(f"  [{city_key}] Retraining failed: {e}")
         return False
 
 
-# ── Full daily cycle ───────────────────────────────────────────────
+# ── Daily cycle pieces ─────────────────────────────────────────────
 
-def run_daily_learning(cities: list[str] = None) -> None:
+def learn(conn: sqlite3.Connection, cities: list[str], retrain: bool = True) -> bool:
     """
-    Full daily learning cycle:
-    1. Verify yesterday's predictions against actuals
-    2. Add verified data to training set
-    3. Retrain models
-    4. Record today's forecasts for tomorrow's verification
+    Verification + training half of the cycle. Returns True if the
+    training set gained or corrected rows (and models were retrained).
     """
-    if cities is None:
-        cities = list(CITIES.keys())
-
-    conn = sqlite3.connect(str(DB_PATH))
-    init_prediction_log(conn)
-    init_historical_tables(conn)
-
-    today = datetime.now().strftime("%Y-%m-%d")
-
-    print(f"\n{'=' * 60}")
-    print(f"  DAILY LEARNING CYCLE — {today}")
-    print(f"{'=' * 60}")
-
-    # Step 1: Verify recent unverified days (not just yesterday — if the
-    # machine was off for a day, that date previously stayed unverified
-    # forever, silently starving live calibration and the sniper gate).
-    print(f"\n--- Verifying recent unverified predictions ---")
     any_new_data = False
+
+    print(f"\n--- Re-verifying provisional actuals against GHCND ---")
     for city in cities:
+        try:
+            if reverify_provisional(conn, city):
+                any_new_data = True
+        except Exception as e:
+            print(f"  [{city}] re-verification failed: {e}")
+
+    # Verify recent unverified days (not just yesterday — if the machine was
+    # off for a day, that date previously stayed unverified forever,
+    # silently starving live calibration and the sniper gate).
+    print(f"\n--- Verifying recent unverified predictions ---")
+    for city in cities:
+        today = _local_today(city)
         pending = conn.execute("""
             SELECT date FROM daily_predictions
             WHERE city = ? AND actual_high_f IS NULL AND date < ?
@@ -438,27 +457,55 @@ def run_daily_learning(cities: list[str] = None) -> None:
                 if add_to_training_data(conn, city, check_date):
                     any_new_data = True
 
-    # Step 2: Retrain if we got new data
-    if any_new_data:
-        print(f"\n--- Retraining models with new data ---")
-        for city in cities:
-            retrain_model(conn, city)
-    else:
-        print(f"\n  No new data to retrain on.")
+    if retrain:
+        if any_new_data:
+            print(f"\n--- Retraining models with new data ---")
+            for city in cities:
+                retrain_model(conn, city)
+        else:
+            print(f"\n  No new official data to retrain on.")
+    return any_new_data
 
-    # Step 3: Record today's forecasts
-    print(f"\n--- Recording today's forecasts ({today}) ---")
-    for city in cities:
-        record_forecasts(conn, city, today)
 
-    # Also record tomorrow's if available
-    tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-    print(f"\n--- Recording tomorrow's forecasts ({tomorrow}) ---")
+def record(conn: sqlite3.Connection, cities: list[str]) -> None:
+    """Record today's and tomorrow's forecasts for later verification."""
+    print(f"\n--- Recording today's forecasts ---")
     for city in cities:
+        record_forecasts(conn, city, _local_today(city))
+
+    print(f"\n--- Recording tomorrow's forecasts ---")
+    for city in cities:
+        tomorrow = (datetime.now(ZoneInfo(CITIES[city].timezone))
+                    + timedelta(days=1)).strftime("%Y-%m-%d")
         record_forecasts(conn, city, tomorrow)
 
-    conn.close()
 
+def run_daily_learning(cities: list[str] = None, retrain: bool = True,
+                       do_record: bool = True) -> None:
+    """
+    Full daily learning cycle:
+    1. Re-verify provisional actuals against GHCND; verify recent days
+    2. Sync official data into the training set and retrain
+    3. Record today's/tomorrow's forecasts for later verification
+    """
+    if cities is None:
+        cities = list(CITIES.keys())
+
+    conn = sqlite3.connect(str(DB_PATH))
+    init_prediction_log(conn)
+    init_historical_tables(conn)
+    migrate_db(conn, verbose=True)
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    print(f"\n{'=' * 60}")
+    print(f"  DAILY LEARNING CYCLE — {today}")
+    print(f"{'=' * 60}")
+
+    learn(conn, cities, retrain=retrain)
+    if do_record:
+        record(conn, cities)
+
+    conn.close()
     print(f"\n  Daily learning cycle complete.")
 
 
@@ -467,6 +514,7 @@ def run_daily_learning(cities: list[str] = None) -> None:
 def print_learning_stats(conn: sqlite3.Connection) -> None:
     """Print statistics about the daily learning process."""
     init_prediction_log(conn)
+    migrate_db(conn)
 
     print(f"\n{'=' * 60}")
     print(f"  DAILY LEARNING STATS")
@@ -483,7 +531,10 @@ def print_learning_stats(conn: sqlite3.Connection) -> None:
                    MIN(date), MAX(date),
                    AVG(ABS(icon_error)),
                    AVG(ABS(wk_error)),
-                   SUM(CASE WHEN wk_error IS NOT NULL THEN 1 ELSE 0 END)
+                   SUM(CASE WHEN wk_error IS NOT NULL THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN actual_source = 'station' THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN actual_source = 'feed' THEN 1 ELSE 0 END),
+                   AVG(CASE WHEN actual_source = 'station' THEN model_error END)
             FROM daily_predictions
             WHERE city = ?
         """, (city_key,)).fetchone()
@@ -496,39 +547,59 @@ def print_learning_stats(conn: sqlite3.Connection) -> None:
         print(f"\n  {city_key.upper()}")
         print(f"  {'─' * 40}")
         print(f"  Recorded:   {total} days ({row[6]} to {row[7]})")
-        print(f"  Verified:   {verified} days")
+        print(f"  Verified:   {verified} days  (official GHCND: {row[11] or 0}, "
+              f"provisional feed: {row[12] or 0}, other/legacy: "
+              f"{verified - (row[11] or 0) - (row[12] or 0)})")
         print(f"  Pending:    {total - verified} days")
 
         if verified > 0:
             model_mae = row[2]
-            gfs_mae = row[3]
-            ecmwf_mae = row[4]
-            blend_mae = row[5]
-
-            print(f"\n  Daily tracking MAE:")
+            print(f"\n  Daily tracking MAE (all verified days):")
             if model_mae is not None:
-                print(f"    Trained model: {model_mae:.2f}°F")
-            if gfs_mae is not None:
-                print(f"    GFS:           {gfs_mae:.2f}°F")
-            if ecmwf_mae is not None:
-                print(f"    ECMWF:         {ecmwf_mae:.2f}°F")
-            if blend_mae is not None:
-                print(f"    Blend:         {blend_mae:.2f}°F")
-            if row[8] is not None:
-                print(f"    ICON:          {row[8]:.2f}°F")
+                print(f"    Trained model: {model_mae:.2f}°F"
+                      + (f"  (bias vs official {row[13]:+.2f}°F)" if row[13] is not None else ""))
+            for label, val in (("GFS", row[3]), ("ECMWF", row[4]), ("Blend", row[5]),
+                               ("ICON", row[8])):
+                if val is not None:
+                    print(f"    {label:<14} {val:.2f}°F")
             if row[9] is not None:
                 print(f"    Apple:         {row[9]:.2f}°F  ({row[10]} days)")
                 _print_weatherkit_status(city_key)
 
+        _print_live_calibration(city_key)
+
     # Training data growth
     print(f"\n  {'─' * 40}")
-    print(f"  Training data size:")
+    print(f"  Training data size (clean lead-1, official-truth rows):")
     for city_key in CITIES:
         count = conn.execute(
-            "SELECT COUNT(*) FROM historical_forecasts WHERE city = ?",
+            "SELECT COUNT(*) FROM historical_forecasts WHERE city = ? "
+            "AND lead_ok = 1 AND actual_source = 'station'",
             (city_key,)
         ).fetchone()[0]
-        print(f"    {city_key}: {count} days")
+        total = conn.execute(
+            "SELECT COUNT(*) FROM historical_forecasts WHERE city = ?",
+            (city_key,)).fetchone()[0]
+        print(f"    {city_key}: {count} days (of {total} stored)")
+
+
+def _print_live_calibration(city_key: str) -> None:
+    """Current-model errors over recent official days, plus σ coverage."""
+    try:
+        from weather_ensemble import live_calibration_errors
+        from train_model import load_model
+        errs = live_calibration_errors(city_key)
+        if len(errs) < 3:
+            print(f"    Live calibration: only {len(errs)} official day(s) re-scored")
+            return
+        mean = sum(errs) / len(errs)
+        sd = (sum((e - mean) ** 2 for e in errs) / max(len(errs) - 1, 1)) ** 0.5
+        md = load_model(get_model_path(city_key))
+        const = md.get("residual_std")
+        print(f"    Live calibration (current model, {len(errs)} official days): "
+              f"bias {mean:+.2f}°F, σ {sd:.2f}°F  [model residual σ {const:.2f}]")
+    except Exception as e:
+        print(f"    Live calibration unavailable: {e}")
 
 
 def _print_weatherkit_status(city_key: str) -> None:
@@ -546,11 +617,11 @@ def _print_weatherkit_status(city_key: str) -> None:
             SELECT COUNT(*), AVG(ABS(wk_error)), AVG(ABS(model_error))
             FROM daily_predictions
             WHERE city = ? AND wk_error IS NOT NULL
-              AND model_error IS NOT NULL
+              AND model_error IS NOT NULL AND actual_source = 'station'
         """, (city_key,)).fetchone()
         conn.close()
         if n:
-            print(f"    → Same-day comparison ({n} day(s)): "
+            print(f"    → Same-day comparison ({n} official day(s)): "
                   f"Apple MAE {wk_mae:.2f}°F vs model {model_mae:.2f}°F")
     except Exception:
         pass
@@ -581,9 +652,9 @@ if __name__ == "__main__":
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Commands:
-  (default)    Full daily cycle: verify → learn → retrain → record
-  record       Just record today's forecasts
-  learn        Just verify yesterday and retrain
+  (default)    Full daily cycle: re-verify → verify → learn → retrain → record
+  record       Just record today's/tomorrow's forecasts
+  learn        Just re-verify/verify and retrain
   stats        Show learning statistics
         """
     )
@@ -602,31 +673,16 @@ Commands:
     elif args.command == "record":
         conn = sqlite3.connect(str(DB_PATH))
         init_prediction_log(conn)
-        today = datetime.now().strftime("%Y-%m-%d")
-        for city in (cities or list(CITIES.keys())):
-            record_forecasts(conn, city, today)
+        migrate_db(conn)
+        record(conn, cities or list(CITIES.keys()))
         conn.close()
 
     elif args.command == "learn":
         conn = sqlite3.connect(str(DB_PATH))
         init_prediction_log(conn)
         init_historical_tables(conn)
-        today = datetime.now().strftime("%Y-%m-%d")
-        any_new = False
-        for city in (cities or list(CITIES.keys())):
-            pending = conn.execute("""
-                SELECT date FROM daily_predictions
-                WHERE city = ? AND actual_high_f IS NULL AND date < ?
-                ORDER BY date DESC LIMIT ?
-            """, (city, today, VERIFY_LOOKBACK_DAYS)).fetchall()
-            for (check_date,) in pending:
-                result = verify_yesterday(conn, city, check_date)
-                if result and not result.get("already_done"):
-                    if add_to_training_data(conn, city, check_date):
-                        any_new = True
-        if any_new:
-            for city in (cities or list(CITIES.keys())):
-                retrain_model(conn, city)
+        migrate_db(conn, verbose=True)
+        learn(conn, cities or list(CITIES.keys()))
         conn.close()
 
     elif args.command == "stats":

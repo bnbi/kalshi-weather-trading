@@ -50,13 +50,12 @@ from zoneinfo import ZoneInfo
 import numpy as np
 
 from weather import CITIES, get_hourly_forecast
-from model import parse_contract_ticker
-from find_edge import (get_market_prices, parse_price, TradeSignal,
+from model import parse_contract_ticker, threshold_is_below
+from find_edge import (get_market_prices, market_price, TradeSignal,
                        kalshi_fee_per_contract)
-from trader import (size_orders, execute_orders, optimize_with_orderbook,
-                    check_existing_positions)
-from pnl_tracker import log_trade_results
+from trader import load_risk_config, _size_and_execute
 from kalshi_client import create_client_from_config
+from db_migrations import migrate_db
 import station_obs
 from station_obs import get_observed_max
 
@@ -76,8 +75,10 @@ MAX_TRADES_PER_CITY = 2
 DEFAULT_BUDGET = None   # None = MAX_RUN_EXPOSURE_PCT of bankroll (config)
 MC_SAMPLES = 20000
 
-# Validation gate for --auto mode
-VALIDATION_MIN_SIGNALS = 15
+# Validation gate for --auto mode. 15 signals at a capped 93% claim could
+# pass on luck alone; 30 plus a proper-scoring-rule test against the ask
+# price (the market's own forecast) is the minimum for an honest verdict.
+VALIDATION_MIN_SIGNALS = 30
 VALIDATION_MAX_CALIB_GAP = 0.15   # claimed prob may exceed realized win rate by ≤15pts
 
 # Probability-model version. Bump this whenever the final-high model changes so
@@ -127,10 +128,24 @@ def init_sniper_table(conn: sqlite3.Connection) -> None:
             model_version TEXT             -- which prob model scored this signal
         );
     """)
-    # Migration: add model_version to pre-existing tables (NULL = legacy model)
+    # Migrations: model_version (NULL = legacy model); strike_type (so a
+    # threshold signal can be graded in the right direction); truth_source
+    # (what graded the outcome: 'kalshi' = the exchange's own settlement,
+    # 'station' = official GHCND, 'legacy' = the old obs-feed/ERA5 proxy).
     cols = {r[1] for r in conn.execute("PRAGMA table_info(sniper_signals)")}
-    if "model_version" not in cols:
-        conn.execute("ALTER TABLE sniper_signals ADD COLUMN model_version TEXT")
+    for col in ("model_version TEXT", "strike_type TEXT", "truth_source TEXT",
+                "legacy_outcome TEXT", "last_ask_price REAL", "times_seen INTEGER"):
+        if col.split()[0] not in cols:
+            conn.execute(f"ALTER TABLE sniper_signals ADD COLUMN {col}")
+    if "truth_source" not in cols:
+        # Outcomes graded before this change used the obs-feed / ERA5
+        # proxy, which differs from the settlement value on ~40% of days.
+        # Keep them for reference and re-grade against real truth.
+        conn.execute("""UPDATE sniper_signals
+                        SET legacy_outcome = outcome, truth_source = 'legacy'
+                        WHERE outcome IS NOT NULL""")
+        conn.execute("""UPDATE sniper_signals SET outcome = NULL, hypo_profit = NULL
+                        WHERE truth_source = 'legacy'""")
     conn.commit()
 
 
@@ -190,10 +205,12 @@ def fit_final_high_model(conn: sqlite3.Connection) -> dict:
     Calibrate the final-high distribution from verified history.
 
     For each past day we have the remaining-hours forecast max logged at signal
-    time (rem_max_f) and the settled high (daily_predictions.actual_high_f).
-    The settlement error (actual − rem_max) gives bias and σ. A conservative
-    σ floor keeps us from ever getting overconfident again; below FH_MIN_HISTORY
-    days we fall back to a deliberately wide default.
+    time (rem_max_f, averaged over that day's signals so a day counts once
+    regardless of how many hourly runs fired) and the OFFICIAL settled high
+    (daily_predictions.actual_high_f, GHCND only). The settlement error
+    (actual − rem_max) gives a single bias and σ — hours_remaining is not a
+    σ input; the floor/cap and the v4 structural rules carry that load.
+    Below FH_MIN_HISTORY days we fall back to a deliberately wide default.
     """
     rows = conn.execute(f"""
         SELECT AVG(s.rem_max_f), p.actual_high_f
@@ -260,13 +277,13 @@ def v4_signal_class(obs_max: float, rem_max: float | None,
     return None
 
 
-def contract_prob_yes(samples: np.ndarray, info: dict, title: str) -> float | None:
+def contract_prob_yes(samples: np.ndarray, info: dict, title: str,
+                      strike_type: str = None) -> float | None:
     """P(contract settles YES) from final-high samples. Settlement is integer °F."""
     settled = np.round(samples)
     if info["type"] == "threshold":
         th = info["threshold"]
-        title_l = title.lower()
-        if "<" in title or "below" in title_l:
+        if threshold_is_below(title, strike_type):
             p = float(np.mean(settled < th))
         else:
             p = float(np.mean(settled > th))
@@ -305,11 +322,13 @@ def find_sniper_signals(city_key: str, local_date: str,
     kalshi_date = f"{dt.year % 100:02d}{months[dt.month - 1]}{dt.day:02d}"
 
     signals = []
+    ctx["strike_types"] = {}
     for m in get_market_prices(city.kalshi_series):
         ticker = m.get("ticker", "")
-        if kalshi_date not in ticker:
+        if f"-{kalshi_date}-" not in ticker:
             continue
         info = parse_contract_ticker(ticker)
+        ctx["strike_types"][ticker] = m.get("strike_type")
         # v4: bracket NO bets only. Thresholds went 1W/14L (7%) in
         # validation; YES bracket bets mean picking the exact 1°F stop —
         # the same bet type the day-ahead post-mortem showed is -80% ROI.
@@ -328,11 +347,12 @@ def find_sniper_signals(city_key: str, local_date: str,
         if sig_class is None:
             continue
 
-        p_yes = contract_prob_yes(samples, info, m.get("title", ""))
+        p_yes = contract_prob_yes(samples, info, m.get("title", ""),
+                                  strike_type=m.get("strike_type"))
         if p_yes is None:
             continue
 
-        no_ask = parse_price(m.get("no_ask_dollars", m.get("no_ask")))
+        no_ask = market_price(m, "no_ask")
         if no_ask is None or no_ask <= 0.02 or no_ask >= 0.97:
             continue
 
@@ -358,50 +378,117 @@ def find_sniper_signals(city_key: str, local_date: str,
 
 def _station_truth_filter(conn: sqlite3.Connection) -> str:
     """
-    SQL clause restricting daily_predictions rows to settlement-station
-    truth. Rows verified from the ERA5 fallback can differ from the station
-    by 1-3°F — enough to flip a bracket outcome — and must never feed the
-    live-money validation gate or the final-high calibration. NULL is
-    accepted for legacy rows written before the source was recorded.
-    Returns '' when the column doesn't exist yet (un-migrated DB).
+    SQL clause restricting daily_predictions rows to OFFICIAL settlement-
+    station truth (NOAA GHCND). Feed-max and ERA5 values differ from the
+    settlement number on ~40% of days — enough to flip a bracket outcome —
+    and must never feed the live-money validation gate or the final-high
+    calibration. Legacy rows are re-labelled by daily_learner's
+    re-verification, so unknown-source rows are excluded, not trusted.
+    Returns a clause that matches nothing when the column doesn't exist.
     """
     try:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(daily_predictions)")}
     except sqlite3.Error:
-        return ""
+        return " AND 0"
     if "actual_source" not in cols:
-        return ""
-    return " AND (p.actual_source IS NULL OR p.actual_source = 'station')"
+        return " AND 0"
+    return " AND p.actual_source = 'station'"
 
 
-def verify_signals(conn: sqlite3.Connection) -> int:
-    """Score past signals against actual highs from daily_predictions."""
-    rows = conn.execute(f"""
-        SELECT s.id, s.ticker, s.side, s.ask_price, p.actual_high_f
+def _record_outcome(conn: sqlite3.Connection, sid: int, side: str, ask: float,
+                    yes_settled: bool, truth_source: str) -> None:
+    won = yes_settled if side == "yes" else not yes_settled
+    # Net of the exchange fee, so the validation gate's "positive
+    # hypothetical P&L" bar matches what live trading would earn.
+    fee = kalshi_fee_per_contract(ask)
+    profit = (1 - ask - fee) if won else (-ask - fee)
+    conn.execute("""UPDATE sniper_signals
+                    SET outcome = ?, hypo_profit = ?, truth_source = ?
+                    WHERE id = ?""",
+                 ("win" if won else "loss", profit, truth_source, sid))
+
+
+def verify_signals(conn: sqlite3.Connection, client=None) -> int:
+    """
+    Score unverified signals against REAL settlement:
+      1. Kalshi's own market result (the exchange's settlement — exact),
+         while the market is still fetchable (~2 weeks);
+      2. otherwise the official GHCND daily high from daily_predictions
+         (never the provisional obs-feed max), with threshold direction
+         taken from the stored strike_type.
+    Signals that can be graded neither way are marked 'void' after 120 days.
+    """
+    n = 0
+    rows = conn.execute("""
+        SELECT id, ticker, side, ask_price, strike_type, date FROM sniper_signals
+        WHERE outcome IS NULL ORDER BY date
+    """).fetchall()
+    if not rows:
+        return 0
+
+    # 1. Exchange settlement
+    if client is None:
+        try:
+            client = create_client_from_config()
+        except Exception:
+            client = None
+    graded = set()
+    if client is not None:
+        results_by_ticker = {}
+        # Kalshi archives markets ~2 weeks after settlement; older signals go
+        # straight to station truth instead of a guaranteed 404 per run.
+        fetch_floor = (datetime.now(timezone.utc) - timedelta(days=21)).strftime("%Y-%m-%d")
+        for sid, ticker, side, ask, strike_type, date in rows:
+            if date < fetch_floor:
+                continue
+            if ticker in results_by_ticker:
+                result = results_by_ticker[ticker]
+            else:
+                try:
+                    market = client.get_market(ticker).get("market", {})
+                    ok = market.get("status") in ("settled", "finalized")
+                    result = market.get("result") if ok else None
+                except Exception:
+                    result = None
+                results_by_ticker[ticker] = result
+                time.sleep(0.1)
+            if result in ("yes", "no"):
+                _record_outcome(conn, sid, side, ask, result == "yes", "kalshi")
+                graded.add(sid)
+                n += 1
+
+    # 2. Official station truth for what's left
+    rows2 = conn.execute(f"""
+        SELECT s.id, s.ticker, s.side, s.ask_price, s.strike_type, p.actual_high_f
         FROM sniper_signals s
         JOIN daily_predictions p ON p.date = s.date AND p.city = s.city
         WHERE s.outcome IS NULL AND p.actual_high_f IS NOT NULL
         {_station_truth_filter(conn)}
     """).fetchall()
-
-    n = 0
-    for sid, ticker, side, ask, actual in rows:
+    for sid, ticker, side, ask, strike_type, actual in rows2:
+        if sid in graded:
+            continue
         info = parse_contract_ticker(ticker)
         high = round(actual)
         if info["type"] == "threshold":
-            yes_settled = high > info["threshold"]
+            if not strike_type:
+                continue  # direction unknown — cannot grade honestly
+            if threshold_is_below("", strike_type):
+                yes_settled = high < info["threshold"]
+            else:
+                yes_settled = high > info["threshold"]
         elif info["type"] == "bracket":
             yes_settled = info["bracket_low"] <= high <= info["bracket_high"]
         else:
             continue
-        won = yes_settled if side == "yes" else not yes_settled
-        # Net of the exchange fee, so the validation gate's "positive
-        # hypothetical P&L" bar matches what live trading would earn.
-        fee = kalshi_fee_per_contract(ask)
-        profit = (1 - ask - fee) if won else (-ask - fee)
-        conn.execute("UPDATE sniper_signals SET outcome = ?, hypo_profit = ? WHERE id = ?",
-                     ("win" if won else "loss", profit, sid))
+        _record_outcome(conn, sid, side, ask, yes_settled, "station")
         n += 1
+
+    # 3. Give up on the ungradeable (GHCND is certainly published by then)
+    conn.execute("""
+        UPDATE sniper_signals SET outcome = 'void'
+        WHERE outcome IS NULL AND date < date('now', '-120 days')
+    """)
     conn.commit()
     return n
 
@@ -413,28 +500,41 @@ def validation_status(conn: sqlite3.Connection,
     older models (model_version != current, including legacy NULL rows) are
     excluded so the gate reflects how the model trading today actually performs.
     """
-    row = conn.execute("""
-        SELECT COUNT(*), AVG(CASE WHEN outcome='win' THEN 1.0 ELSE 0.0 END),
-               AVG(prob), SUM(hypo_profit), SUM(ask_price)
+    rows = conn.execute("""
+        SELECT prob, ask_price, outcome, hypo_profit
         FROM sniper_signals
-        WHERE outcome IS NOT NULL AND model_version = ?
-    """, (model_version,)).fetchone()
-    n, win_rate, avg_prob, profit, staked = row
-    n = n or 0
+        WHERE outcome IN ('win', 'loss') AND model_version = ?
+    """, (model_version,)).fetchall()
+    n = len(rows)
+    wins = sum(1 for r in rows if r[2] == "win")
+    win_rate = wins / n if n else None
+    avg_prob = sum(r[0] for r in rows) / n if n else None
+    profit = sum(r[3] or 0 for r in rows) if n else None
+    staked = sum(r[1] for r in rows) if n else None
+    # Proper scoring: our claimed P(NO) vs the market's implied P(NO) (the
+    # ask) on the same outcomes. A gate that only checks "profit > 0" and a
+    # 15-point gap can be passed on luck; the model must also FORECAST
+    # better than the price it is trading against.
+    brier_model = brier_market = None
+    if n:
+        brier_model = sum((r[0] - (1.0 if r[2] == "win" else 0.0)) ** 2 for r in rows) / n
+        brier_market = sum((r[1] - (1.0 if r[2] == "win" else 0.0)) ** 2 for r in rows) / n
     # Count legacy verified signals (old model) for reporting context only
     legacy = conn.execute("""
         SELECT COUNT(*) FROM sniper_signals
-        WHERE outcome IS NOT NULL
+        WHERE outcome IN ('win', 'loss')
           AND (model_version IS NULL OR model_version != ?)
     """, (model_version,)).fetchone()[0]
     passed = bool(
         n >= VALIDATION_MIN_SIGNALS
         and (profit or 0) > 0
         and (avg_prob or 1) - (win_rate or 0) <= VALIDATION_MAX_CALIB_GAP
+        and brier_model is not None and brier_model < brier_market
     )
     return {"n_verified": n, "win_rate": win_rate, "avg_claimed_prob": avg_prob,
             "hypo_profit": profit, "hypo_staked": staked, "passed": passed,
-            "n_legacy": legacy, "model_version": model_version}
+            "n_legacy": legacy, "model_version": model_version,
+            "brier_model": brier_model, "brier_market": brier_market}
 
 
 # ── Main run ────────────────────────────────────────────────────────
@@ -446,7 +546,26 @@ def run(cities: list[str] = None, mode: str = "dry", budget: float = DEFAULT_BUD
 
     conn = sqlite3.connect(str(DB_PATH))
     init_sniper_table(conn)
-    verify_signals(conn)  # opportunistically score old signals
+    migrate_db(conn)
+
+    # Exchange access is optional in dry mode (paper deployments have no
+    # credentials); with it we grade signals on real settlement and true up
+    # the day-ahead run's fills every hour — the stale-order backstop used
+    # to run only once a day.
+    client = None
+    try:
+        client = create_client_from_config()
+    except Exception as e:
+        print(f"  (no Kalshi credentials: {e}; grading on station truth only)")
+    if client is not None:
+        try:
+            from pnl_tracker import init_pnl_tables, reconcile_fills
+            init_pnl_tables(conn)
+            reconcile_fills(conn, client)
+        except Exception as e:
+            print(f"  Warning: fill reconciliation failed: {e}")
+
+    verify_signals(conn, client)  # opportunistically score old signals
 
     # Calibrate the final-high model from verified history (once per run)
     fh_model = fit_final_high_model(conn)
@@ -457,11 +576,14 @@ def run(cities: list[str] = None, mode: str = "dry", budget: float = DEFAULT_BUD
     if mode == "auto":
         status = validation_status(conn)
         mode = "live" if status["passed"] else "dry"
+        bm = status.get("brier_model"); bk = status.get("brier_market")
         print(f"AUTO mode → {mode.upper()} "
               f"(verified={status['n_verified']}, "
               f"hypo P&L={status['hypo_profit'] or 0:+.2f}, "
               f"win rate={(status['win_rate'] or 0):.0%} vs "
-              f"claimed {(status['avg_claimed_prob'] or 0):.0%})")
+              f"claimed {(status['avg_claimed_prob'] or 0):.0%}"
+              + (f", Brier model {bm:.3f} vs market {bk:.3f}" if bm is not None else "")
+              + ")")
 
     cities = cities or list(CITIES.keys())
     all_signals: list[tuple[str, TradeSignal, dict]] = []
@@ -490,33 +612,39 @@ def run(cities: list[str] = None, mode: str = "dry", budget: float = DEFAULT_BUD
     # Log every signal (dry or live) for validation.
     # Deduplicate: skip if we already logged this (date, ticker, side) today —
     # multiple runs per day would otherwise inflate signal count and make
-    # validation stats noisy with correlated duplicates.
+    # validation stats noisy with correlated duplicates. Repeat sightings
+    # update last_ask_price / times_seen so persistence is still visible.
     now_iso = datetime.now(timezone.utc).isoformat()
     logged = 0
     for ck, s, ctx in all_signals:
         tz = ZoneInfo(CITIES[ck].timezone)
         local_date = datetime.now(tz).strftime("%Y-%m-%d")
         already = conn.execute("""
-            SELECT 1 FROM sniper_signals
+            SELECT id FROM sniper_signals
             WHERE date = ? AND ticker = ? AND side = ? LIMIT 1
         """, (local_date, s.ticker, s.side)).fetchone()
         if already:
+            conn.execute("""UPDATE sniper_signals
+                            SET last_ask_price = ?, times_seen = COALESCE(times_seen, 1) + 1
+                            WHERE id = ?""", (s.market_price, already[0]))
             continue
         conn.execute("""
             INSERT INTO sniper_signals
             (created_at, date, city, ticker, side, prob, ask_price,
-             obs_max_f, rem_max_f, hours_remaining, mode, model_version)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             obs_max_f, rem_max_f, hours_remaining, mode, model_version,
+             strike_type, last_ask_price, times_seen)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
         """, (now_iso, local_date, ck, s.ticker, s.side,
               s.model_prob, s.market_price,
               ctx["obs"]["obs_max_f"] if ctx["obs"] else None,
               ctx["rem"]["rem_max_f"] if ctx["rem"] else None,
               ctx["rem"]["hours_remaining"] if ctx["rem"] else None,
-              mode, MODEL_VERSION))
+              mode, MODEL_VERSION,
+              (ctx.get("strike_types") or {}).get(s.ticker), s.market_price))
         logged += 1
     conn.commit()
     if logged < len(all_signals):
-        print(f"  ({len(all_signals) - logged} duplicate signal(s) skipped — already logged today)")
+        print(f"  ({len(all_signals) - logged} repeat signal(s) — already logged today)")
 
     print(f"\n  {len(all_signals)} signal(s) [{mode.upper()}]:")
     for ck, s, _ in all_signals:
@@ -529,83 +657,20 @@ def run(cities: list[str] = None, mode: str = "dry", budget: float = DEFAULT_BUD
         return
 
     # ── Live execution path ─────────────────────────────────────────
-    client = create_client_from_config()
-
-    # True-up fills and cancel stale resting orders BEFORE committing new
-    # capital — resting maker orders fill adversely (the price only reaches
-    # them when the market has moved against the thesis).
-    try:
-        from pnl_tracker import init_pnl_tables, reconcile_fills
-        init_pnl_tables(conn)
-        reconcile_fills(conn, client)
-    except Exception as e:
-        print(f"  Warning: fill reconciliation failed: {e}")
-
-    balance = client.get_balance().get("balance", 0) / 100
-    # Percentage-based budget, same scheme as the day-ahead trader;
-    # an explicit --budget still acts as a hard dollar ceiling.
-    try:
-        from config import MAX_RUN_EXPOSURE_PCT as _pct
-    except ImportError:
-        _pct = 0.25
-    pct_budget = balance * _pct
-    budget = min(budget, pct_budget) if budget is not None else pct_budget
-    budget = min(budget, balance)
-    if budget <= 0.5:
-        print("  Insufficient balance.")
+    if client is None:
+        print("  Live mode requested but no Kalshi credentials — aborting.")
         conn.close()
         return
-
+    cfg = load_risk_config()
     signals_only = [s for _, s, _ in all_signals]
-    existing = check_existing_positions(client, [s.ticker for s in signals_only])
-    if existing:
-        print(f"  Skipping existing positions: {list(existing.keys())}")
-        signals_only = [s for s in signals_only if s.ticker not in existing]
-
-    # Percentage-based sizing, same scheme as the day-ahead trader
-    try:
-        import config
-        max_position = balance * getattr(config, "MAX_POSITION_PCT", 0.08)
-        kelly = getattr(config, "KELLY_FRACTION", 0.25)
-        max_contracts = getattr(config, "MAX_CONTRACTS_PER_ORDER", 15)
-        max_open = getattr(config, "MAX_OPEN_POSITIONS", 6)
-    except ImportError:
-        max_position, kelly, max_contracts, max_open = balance * 0.08, 0.25, 15, 6
-
-    # MAX_OPEN_POSITIONS counts TOTAL simultaneous positions across both
-    # strategies, so open slots come off this run's allowance.
-    from trader import count_open_positions
-    n_open = count_open_positions(client)
-    if n_open:
-        max_open = max(0, max_open - n_open)
-        if max_open == 0:
-            print("  Position limit reached — no new positions.")
-            conn.close()
-            return
-
-    orders = size_orders(signals_only, bankroll=balance, kelly_fraction=kelly,
-                         max_position_dollars=max_position,
-                         max_contracts=max_contracts,
-                         max_total_dollars=budget, max_positions=max_open)
-    if not orders:
-        print("  Nothing sized to trade.")
-        conn.close()
-        return
-
-    orders = optimize_with_orderbook(client, orders)
-    if not orders:
-        print("  All orders filtered by orderbook (thin/wide).")
-        conn.close()
-        return
-
-    results = execute_orders(client, orders, dry_run=False)
-    ok = [r for r in results if r.success]
+    results = _size_and_execute(client, signals_only, dry_run=False, cfg=cfg,
+                                max_spend=budget, label=" (sniper)")
+    ok = [r for r in results if r.success and (r.filled_contracts is None
+                                               or r.filled_contracts > 0)]
     if ok:
-        log_trade_results(ok)
         # Match on (date, ticker, side) — NOT created_at: a signal first
         # logged by an earlier (possibly dry) run today keeps that run's
-        # created_at, and matching on it silently left live trades
-        # unmarked. The sniper trades same-day contracts, so the signal's
+        # created_at. The sniper trades same-day contracts, so the signal's
         # date column equals the date embedded in the ticker. Upgrade mode
         # to 'live' too so the record shows what actually happened.
         for r in ok:
@@ -615,16 +680,13 @@ def run(cities: list[str] = None, mode: str = "dry", budget: float = DEFAULT_BUD
                             WHERE date = ? AND ticker = ? AND side = ?""",
                          (sig_date, r.order.ticker, r.order.side))
         conn.commit()
-    for r in results:
-        tag = "OK" if r.success else f"FAILED: {r.error}"
-        print(f"    [{tag}] {r.order.ticker} {r.order.side} x{r.order.contracts} "
-              f"@ {r.order.price_cents}¢")
     conn.close()
 
 
 def report():
     conn = sqlite3.connect(str(DB_PATH))
     init_sniper_table(conn)
+    migrate_db(conn)
     n = verify_signals(conn)
     if n:
         print(f"Verified {n} new signal(s).")
@@ -638,13 +700,18 @@ def report():
         print(f"  Win rate:           {s['win_rate']:.0%} (claimed {s['avg_claimed_prob']:.0%}, "
               f"gap {s['avg_claimed_prob'] - s['win_rate']:+.0%})")
         print(f"  Hypothetical P&L:   ${s['hypo_profit']:+.2f} on ${s['hypo_staked']:.2f} staked")
+        print(f"  Brier (lower=better): model {s['brier_model']:.3f} vs market ask "
+              f"{s['brier_market']:.3f} — "
+              f"{'model beats the price' if s['brier_model'] < s['brier_market'] else 'the PRICE is the better forecaster'}")
     else:
         print(f"  (no verified signals under the current model yet — keep running dry)")
     print(f"  LIVE TRADING GATE:  {'PASSED — --auto will trade live' if s['passed'] else 'not yet passed — --auto stays dry'}")
+    print(f"  (gate: ≥{VALIDATION_MIN_SIGNALS} graded signals, positive hypo P&L, "
+          f"≤{VALIDATION_MAX_CALIB_GAP:.0%} calibration gap, Brier below the ask)")
 
-    print(f"\n  Recent signals:")
+    print(f"\n  Recent signals (outcome / truth source):")
     for r in conn.execute("""SELECT date, city, ticker, side, ROUND(prob,2), ask_price,
-                                    mode, COALESCE(outcome,'?'),
+                                    mode, COALESCE(outcome,'?'), COALESCE(truth_source,'-'),
                                     COALESCE(model_version,'legacy')
                              FROM sniper_signals ORDER BY id DESC LIMIT 15"""):
         print(f"    {r}")
@@ -677,6 +744,7 @@ if __name__ == "__main__":
     elif args.cmd == "verify":
         conn = sqlite3.connect(str(DB_PATH))
         init_sniper_table(conn)
+        migrate_db(conn)
         print(f"Verified {verify_signals(conn)} signal(s).")
         conn.close()
     else:

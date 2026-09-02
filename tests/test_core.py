@@ -161,15 +161,16 @@ def test_blended_edge_is_half_raw_gap_minus_fee():
     assert no_sigs, "expected a NO signal within the credibility band"
     raw_gap = 0.95 - no_ask
     fee = find_edge.kalshi_fee_per_contract(no_ask)
-    assert fee == pytest.approx(0.02)  # ceil(0.07*0.75*0.25 = 1.3c) = 2c
+    assert fee == pytest.approx(0.07 * 0.75 * 0.25)  # exact, no rounding up
     assert no_sigs[0].edge == pytest.approx(0.5 * raw_gap - fee, abs=1e-9)
 
 
 def test_fee_formula():
-    # Worst case at 50c: ceil(0.07*0.25*100)=ceil(1.75)=2c
-    assert find_edge.kalshi_fee_per_contract(0.50) == pytest.approx(0.02)
-    assert find_edge.kalshi_fee_per_contract(0.70) == pytest.approx(0.02)
-    assert find_edge.kalshi_fee_per_contract(0.95) == pytest.approx(0.01)
+    # Kalshi charges the exact 0.07*P*(1-P) per contract (the ledger shows
+    # $0.0294 for 2 @ 70c); the old ceil-to-cent overstated it by ~35%.
+    assert find_edge.kalshi_fee_per_contract(0.50) == pytest.approx(0.0175)
+    assert find_edge.kalshi_fee_per_contract(0.70) == pytest.approx(0.0147)
+    assert find_edge.kalshi_fee_per_contract(0.95) == pytest.approx(0.003325)
     assert find_edge.kalshi_fee_per_contract(0.0) == 0.0
     assert find_edge.kalshi_fee_per_contract(1.0) == 0.0
 
@@ -231,7 +232,7 @@ def test_fit_final_high_model_falls_back_when_sparse():
     conn = sqlite3.connect(":memory:")
     sniper.init_sniper_table(conn)
     conn.execute("""CREATE TABLE daily_predictions
-                    (date TEXT, city TEXT, actual_high_f REAL)""")
+                    (date TEXT, city TEXT, actual_high_f REAL, actual_source TEXT)""")
     m = sniper.fit_final_high_model(conn)
     assert m["sigma"] == sniper.DEFAULT_FH_SIGMA
     assert m["n"] == 0
@@ -241,7 +242,7 @@ def test_fit_final_high_model_floors_sigma():
     conn = sqlite3.connect(":memory:")
     sniper.init_sniper_table(conn)
     conn.execute("""CREATE TABLE daily_predictions
-                    (date TEXT, city TEXT, actual_high_f REAL)""")
+                    (date TEXT, city TEXT, actual_high_f REAL, actual_source TEXT)""")
     # Insert >= FH_MIN_HISTORY days where actual == forecast exactly (zero error).
     for i in range(sniper.FH_MIN_HISTORY + 2):
         d = f"2026-06-{i+1:02d}"
@@ -249,7 +250,7 @@ def test_fit_final_high_model_floors_sigma():
             (created_at,date,city,ticker,side,prob,ask_price,rem_max_f,mode)
             VALUES('x',?,?,?,?,?,?,?,?)""",
             (d, "nyc", "KXHIGHNY-x-T80", "no", 0.9, 0.5, 80.0, "dry"))
-        conn.execute("INSERT INTO daily_predictions VALUES(?,?,?)", (d, "nyc", 80.0))
+        conn.execute("INSERT INTO daily_predictions VALUES(?,?,?,'station')", (d, "nyc", 80.0))
     conn.commit()
     m = sniper.fit_final_high_model(conn)
     # Zero measured error, but the floor keeps us from overconfidence.
@@ -304,3 +305,59 @@ def test_gate_fails_below_min_signals():
     _seed_signals(conn, 5, win_rate=1.0, claimed=0.9, model_version=sniper.MODEL_VERSION)
     s = sniper.validation_status(conn)
     assert s["passed"] is False            # n below VALIDATION_MIN_SIGNALS
+
+
+def test_gate_fails_when_market_price_is_the_better_forecaster():
+    """Profitable-looking and 'calibrated' on average, but the ask price
+    scores a better Brier than the model's claims — the exact failure the
+    day-ahead postmortem found. The gate must stay shut."""
+    conn = sqlite3.connect(":memory:")
+    sniper.init_sniper_table(conn)
+    for i in range(40):
+        # claimed 0.85 on every signal; the ask (0.75) tracks reality better:
+        # signals at ask 0.75 win 76% of the time
+        outcome = "win" if i % 25 != 0 and i % 4 != 0 else "loss"
+        conn.execute("""INSERT INTO sniper_signals
+            (created_at,date,city,ticker,side,prob,ask_price,mode,outcome,
+             hypo_profit,model_version)
+            VALUES('x',?,?,?,?,?,?,?,?,?,?)""",
+            (f"2026-06-{i % 28 + 1:02d}", "nyc", f"K-{i}", "no",
+             0.85, 0.75, "dry", outcome, 0.24 if outcome == "win" else -0.76,
+             sniper.MODEL_VERSION))
+    conn.commit()
+    s = sniper.validation_status(conn)
+    assert s["n_verified"] == 40
+    assert s["brier_model"] >= s["brier_market"] or s["passed"] is False
+    assert s["passed"] is False
+
+
+def test_sizing_rounds_price_to_nearest_cent():
+    """0.29 * 100 is 28.999999999999996 in floating point; int() placed
+    the limit a cent BELOW the ask so the order rested instead of filling."""
+    import trader
+    for ask in (0.29, 0.57, 0.58):
+        sig = find_edge.TradeSignal(
+            ticker="KXHIGHCHI-26JUL16-T80", side="yes", action="buy",
+            model_prob=0.75, market_price=ask, edge=0.10,
+            expected_value=0.10, description="t")
+        orders = trader.size_orders([sig], bankroll=100.0, kelly_fraction=0.25,
+                                    max_position_dollars=8.0, max_contracts=15,
+                                    max_total_dollars=25.0, max_positions=6)
+        assert orders and orders[0].price_cents == int(round(ask * 100))
+
+
+def test_parse_unknown_month_is_unknown_not_january():
+    info = model.parse_contract_ticker("KXHIGHCHI-26XYZ05-T65")
+    assert info["type"] == "unknown"
+
+
+def test_threshold_direction_prefers_strike_type():
+    # title says nothing useful; the API's strike_type decides
+    assert model.threshold_is_below("Will it be hot?", "less") is True
+    assert model.threshold_is_below("high <58", "greater") is False
+    assert model.threshold_is_below("high <58", None) is True
+    info = {"type": "threshold", "threshold": 58.0}
+    below = model.compute_probability(60.0, 2.0, 0.0, info, title="", strike_type="less")
+    above = model.compute_probability(60.0, 2.0, 0.0, info, title="", strike_type="greater")
+    assert below == pytest.approx(_ncdf(57.5, 60.0, 2.0), abs=1e-6)
+    assert above == pytest.approx(1 - _ncdf(58.5, 60.0, 2.0), abs=1e-6)

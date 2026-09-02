@@ -6,8 +6,10 @@
     <string>com.kalshi.sniper</string>
 
     <!-- Run the same-day sniper in --auto mode: it trades live only after
-         its validation gate passes (>=15 verified signals, positive hypothetical
-         P&L, honest calibration). Until then every run is a logged dry run. -->
+         its validation gate passes (>=30 signals graded on real settlement,
+         positive hypothetical P&L, honest calibration, and a better Brier
+         score than the ask price). Until then every run is a logged dry run
+         that also trues up the day-ahead run's fills. -->
     <key>ProgramArguments</key>
     <array>
         <string>/Users/YOUR_USERNAME/kalshi-bot/venv/bin/python</string>

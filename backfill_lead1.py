@@ -15,9 +15,13 @@ computing the daily max per local day. It is:
     in {src}_lead0_f before being overwritten (same pattern as era5_high_f).
   - IDEMPOTENT: re-running refetches the same lead-1 values; lead-0
     preservation only happens while {src}_lead0_f is NULL.
-  - PARTIAL BY DESIGN: model coverage varies (GFS from 2021, ECMWF/ICON/
+  - PARTIAL coverage: model coverage varies (GFS from 2021, ECMWF/ICON/
     best_match from ~2024). Sources without lead-1 data for a date keep
-    their lead-0 value — better than dropping 2021-2023 entirely.
+    their lead-0 value, and such MIXED-LEAD rows get lead_ok = 0 so
+    train_model never sees them (a lead-0 ICON next to lead-1 GFS taught
+    the models to lean on ICON far beyond its live skill).
+  - Live-collected rows (source='live') are never touched: the live feed
+    is the serving distribution and is the training anchor for its dates.
 
 Usage:
     python backfill_lead1.py            # backfill all cities, then retrain
@@ -45,9 +49,9 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import requests
-
 from weather import CITIES
+from http_util import get_with_retry
+from db_migrations import migrate_db
 
 DB_PATH = str(Path(__file__).parent / "kalshi_data.db")
 PREV_RUNS_URL = "https://previous-runs-api.open-meteo.com/v1/forecast"
@@ -64,10 +68,11 @@ CHUNK_DAYS = 90
 
 
 def ensure_lead0_columns(conn: sqlite3.Connection) -> None:
-    for src in SOURCES:
+    cols = [f"{src}_lead0_f REAL" for src in SOURCES]
+    cols += ["source TEXT", "lead_days INTEGER", "lead_ok INTEGER", "actual_source TEXT"]
+    for col in cols:
         try:
-            conn.execute(f"ALTER TABLE historical_forecasts "
-                         f"ADD COLUMN {src}_lead0_f REAL")
+            conn.execute(f"ALTER TABLE historical_forecasts ADD COLUMN {col}")
             conn.commit()
         except sqlite3.OperationalError:
             pass  # already exists
@@ -75,7 +80,7 @@ def ensure_lead0_columns(conn: sqlite3.Connection) -> None:
 
 def fetch_lead1_daily_max(city, model: str, start: str, end: str) -> dict:
     """{date: lead-1 daily max °F} from hourly previous_day1 values."""
-    resp = requests.get(PREV_RUNS_URL, params={
+    resp = get_with_retry(PREV_RUNS_URL, params={
         "latitude": city.lat,
         "longitude": city.lon,
         "hourly": "temperature_2m_previous_day1",
@@ -85,7 +90,6 @@ def fetch_lead1_daily_max(city, model: str, start: str, end: str) -> dict:
         "end_date": end,
         "models": model,
     }, headers=HEADERS, timeout=60)
-    resp.raise_for_status()
     data = resp.json()
     hourly = data.get("hourly", {})
     times = hourly.get("time", [])
@@ -135,7 +139,9 @@ def backfill_city(conn: sqlite3.Connection, city_key: str) -> int:
                gfs_forecast_f, ecmwf_forecast_f, blend_forecast_f,
                icon_forecast_f,
                gfs_lead0_f, ecmwf_lead0_f, blend_lead0_f, icon_lead0_f
-        FROM historical_forecasts WHERE city = ? ORDER BY date
+        FROM historical_forecasts
+        WHERE city = ? AND (source IS NULL OR source != 'live')
+        ORDER BY date
     """, (city_key,)).fetchall()
 
     updated = 0
@@ -172,6 +178,12 @@ def backfill_city(conn: sqlite3.Connection, city_key: str) -> int:
             sets.append("model_spread = ?")
             params.append(max(core) - min(core))
 
+        # lead_ok: every source now holds a genuine lead-1 value
+        all_l1 = all(lead1[src].get(date_str) is not None for src in SOURCES)
+        sets.append("lead_ok = ?")
+        params.append(1 if all_l1 else 0)
+        sets.append("source = 'archive'")
+
         params += [date_str, city_key]
         conn.execute(f"""UPDATE historical_forecasts SET {', '.join(sets)}
                          WHERE date = ? AND city = ?""", params)
@@ -195,7 +207,9 @@ def revert_city(conn: sqlite3.Connection, city_key: str) -> int:
                gfs_forecast_f, ecmwf_forecast_f, blend_forecast_f,
                icon_forecast_f,
                gfs_lead0_f, ecmwf_lead0_f, blend_lead0_f, icon_lead0_f
-        FROM historical_forecasts WHERE city = ? ORDER BY date
+        FROM historical_forecasts
+        WHERE city = ? AND (source IS NULL OR source != 'live')
+        ORDER BY date
     """, (city_key,)).fetchall()
 
     reverted = 0
@@ -224,6 +238,7 @@ def revert_city(conn: sqlite3.Connection, city_key: str) -> int:
         if len(core) > 1:
             sets.append("model_spread = ?")
             params.append(max(core) - min(core))
+        sets.append("lead_ok = 0")  # restored lead-0 data is not training-clean
 
         params += [date_str, city_key]
         conn.execute(f"""UPDATE historical_forecasts SET {', '.join(sets)}
@@ -249,6 +264,7 @@ def main():
 
     conn = sqlite3.connect(args.db)
     ensure_lead0_columns(conn)
+    migrate_db(conn, verbose=True)
     cities = [args.city] if args.city else list(CITIES.keys())
 
     print("=" * 60)

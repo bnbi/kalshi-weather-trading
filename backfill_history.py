@@ -3,16 +3,21 @@ Historical Data Backfill & Model Bootstrap
 
     python backfill_history.py
 
-It does four things, in order:
+It does five things, in order:
     1. Extends forecast history back to 2021-04-01 (~3x more training data)
        via Open-Meteo's historical forecast API.
     2. Adds ICON (German DWD model) as a 4th forecast source for all dates.
     3. Replaces ERA5 reanalysis "actuals" with the OFFICIAL settlement-station
        readings from NOAA GHCND (the numbers Kalshi actually settles on).
        The old ERA5 value is preserved in era5_high_f for reference.
-    4. Retrains all city models on the corrected, enlarged dataset.
+    4. Re-sources every archive forecast at LEAD-1 (backfill_lead1.py) —
+       the historical-forecast API serves same-day values, which are not
+       what the bot trades on.
+    5. Retrains all city models on the corrected, enlarged dataset.
 
-Safe to re-run: all writes are idempotent upserts/updates.
+Only rows that end up lead-1-clean with an official actual are used for
+training (train_model.load_training_data). Safe to re-run: all writes are
+idempotent upserts/updates, and live-collected rows are never overwritten.
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ from historical_data import (
     fetch_historical_forecasts,
 )
 from station_obs import fetch_ghcnd_daily_highs
+from db_migrations import migrate_db
 
 from pathlib import Path
 DB_PATH = str(Path(__file__).parent / "kalshi_data.db")
@@ -120,6 +126,8 @@ def fix_actuals_to_station(conn: sqlite3.Connection, city_key: str) -> dict:
     """, (city_key,)).fetchall()
     if not rows:
         return {}
+    from daily_learner import init_prediction_log
+    init_prediction_log(conn)   # daily_predictions must exist for the mirror update
 
     start, end = rows[0][0], rows[-1][0]
     print(f"  [{city_key}] fetching official station TMAX {start}..{end}")
@@ -158,6 +166,7 @@ def fix_actuals_to_station(conn: sqlite3.Connection, city_key: str) -> dict:
         conn.execute("""
             UPDATE historical_forecasts SET
                 actual_high_f = ?,
+                actual_source = 'station',
                 era5_high_f = ?,
                 gfs_error   = CASE WHEN gfs_forecast_f   IS NOT NULL
                               THEN gfs_forecast_f   - ? END,
@@ -166,9 +175,30 @@ def fix_actuals_to_station(conn: sqlite3.Connection, city_key: str) -> dict:
                 blend_error = CASE WHEN blend_forecast_f IS NOT NULL
                               THEN blend_forecast_f - ? END,
                 icon_error  = CASE WHEN icon_forecast_f  IS NOT NULL
-                              THEN icon_forecast_f  - ? END
+                              THEN icon_forecast_f  - ? END,
+                wk_error    = CASE WHEN wk_forecast_f    IS NOT NULL
+                              THEN wk_forecast_f    - ? END
             WHERE date = ? AND city = ?
-        """, (station, era5_value, station, station, station, station,
+        """, (station, era5_value, station, station, station, station, station,
+              date_str, city_key))
+        # The same official number is the truth for the live log too.
+        conn.execute("""
+            UPDATE daily_predictions SET
+                actual_high_f = ?, actual_source = 'station',
+                model_error = CASE WHEN model_prediction_f IS NOT NULL
+                              THEN model_prediction_f - ? END,
+                gfs_error   = CASE WHEN gfs_forecast_f IS NOT NULL
+                              THEN gfs_forecast_f - ? END,
+                ecmwf_error = CASE WHEN ecmwf_forecast_f IS NOT NULL
+                              THEN ecmwf_forecast_f - ? END,
+                blend_error = CASE WHEN blend_forecast_f IS NOT NULL
+                              THEN blend_forecast_f - ? END,
+                icon_error  = CASE WHEN icon_forecast_f IS NOT NULL
+                              THEN icon_forecast_f - ? END,
+                wk_error    = CASE WHEN wk_forecast_f IS NOT NULL
+                              THEN wk_forecast_f - ? END
+            WHERE date = ? AND city = ?
+        """, (station, station, station, station, station, station, station,
               date_str, city_key))
         replaced += 1
 
@@ -188,27 +218,39 @@ def fix_actuals_to_station(conn: sqlite3.Connection, city_key: str) -> dict:
 def main():
     conn = sqlite3.connect(DB_PATH)
     ensure_schema(conn)
+    migrate_db(conn, verbose=True)
 
     print("=" * 60)
-    print("STEP 1/4: Extend forecast history to", BACKFILL_START)
+    print("STEP 1/5: Extend forecast history to", BACKFILL_START)
     print("=" * 60)
     for city_key in CITIES:
         extend_history(conn, city_key)
 
     print("\n" + "=" * 60)
-    print("STEP 2/4: Backfill ICON forecasts")
+    print("STEP 2/5: Backfill ICON forecasts")
     print("=" * 60)
     for city_key in CITIES:
         backfill_icon(conn, city_key)
 
     print("\n" + "=" * 60)
-    print("STEP 3/4: Replace ERA5 actuals with settlement-station truth")
+    print("STEP 3/5: Replace ERA5 actuals with settlement-station truth")
     print("=" * 60)
     for city_key in CITIES:
         fix_actuals_to_station(conn, city_key)
 
     print("\n" + "=" * 60)
-    print("STEP 4/4: Retrain models on corrected data")
+    print("STEP 4/5: Re-source archive forecasts at lead-1")
+    print("=" * 60)
+    from backfill_lead1 import backfill_city as _lead1_city
+    for city_key in CITIES:
+        try:
+            _lead1_city(conn, city_key)
+        except Exception as e:
+            print(f"  [{city_key}] lead-1 backfill failed: {e}")
+    migrate_db(conn)  # refresh lead_ok / provenance after the upgrade
+
+    print("\n" + "=" * 60)
+    print("STEP 5/5: Retrain models on corrected data")
     print("=" * 60)
     from train_model import train_and_evaluate
     for city_key in CITIES:

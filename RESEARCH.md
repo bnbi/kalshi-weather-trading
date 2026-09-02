@@ -89,7 +89,9 @@ observations). 9 of the 10 worst trades had claimed edges above 27¢.
    from the last 30 *live verified* prediction errors per city rather than
    in-sample CV residuals (live next-day σ ≈ 1.8–2.1°F; the old hard-coded
    floor of 2.5°F distorted bracket probabilities). Bias corrections are
-   clipped to ±1.5°F.
+   clipped to ±1.5°F. *(Sep 2026: the window now re-scores the current model
+   on days with official GHCND actuals only — the obs-feed values it had been
+   using differed from settlement on ~40% of days — and the clip is ±3°F.)*
 4. **Repaired the learning loop.** The daily retrain had been silently failing
    for 3 weeks on NaN inputs (missing forecast sources from API failures).
    Missing sources are now imputed row-wise from available sources. Lesson:
@@ -100,10 +102,20 @@ observations). 9 of the 10 worst trades had claimed edges above 27¢.
 Since the data showed no exploitable modeling edge against same-information
 market makers, the second strategy (`sniper.py`) targets a structurally
 different source: **same-day contracts in the afternoon**, where real-time
-observations from the exact settlement station (KMDW/KNYC/KMIA) often pin the
-final high while thin books still quote stale prices. The model there is a
-Monte Carlo over `max(observed_max + CLI-vs-METAR spike, remaining-hours
-forecast)` — an information/latency edge, not a forecasting edge.
+observations from the exact settlement station often pin the final high while
+thin books still quote stale prices. The current (v4) model centres a Normal
+on the remaining-hours forecast max, floors it at the observed max, and only
+fires on two structural shapes (bracket already passed with a 1.5°F sensor
+margin; afternoon pass-through with ≥2°F forecast overshoot) — an
+information/latency edge, not a forecasting edge.
+
+**Postscript (Sep 2026).** A full audit found the sniper's earlier signals had
+been graded against ERA5 reanalysis and the NWS obs-feed max rather than the
+settlement value; re-grading against official GHCND / exchange results flipped
+19 of 37 outcomes (mostly June "wins" that were losses). The v4 structural
+rules were therefore derived from mis-graded data, and the validation record
+restarts from Sep 2026 with grading on real settlement results and a stricter
+gate (≥30 signals, Brier below the ask price).
 
 ## 5. Validation discipline
 

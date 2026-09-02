@@ -8,7 +8,9 @@ Reproduces, straight from kalshi_data.db, the two charts that tell the story:
      probability forecaster on the traded subset.
   2. Cumulative P&L — the -$23 journey over the trade sequence.
 
-Usage:  python make_figures.py        # writes assets/calibration.png
+Usage:  python make_figures.py              # postmortem window (trades before 2026-08-18)
+        python make_figures.py --all        # every settled trade
+Writes assets/calibration.png
 """
 from __future__ import annotations
 
@@ -25,12 +27,25 @@ OUT = Path(__file__).parent / "assets"
 OUT.mkdir(exist_ok=True)
 
 
-def load_trades():
+# The postmortem (RESEARCH.md) analyzed the trades of the ORIGINAL system.
+# Trades from 2026-08-18 on were placed by a materially different pipeline
+# (station-truth training, fee-net edges, per-day σ, 7 cities), so the
+# figure defaults to the postmortem window and stays consistent with the
+# text; pass --until to move the cutoff or --all for the full record.
+POSTMORTEM_UNTIL = "2026-08-18"
+
+
+def load_trades(until: str | None = POSTMORTEM_UNTIL):
     c = sqlite3.connect(str(DB))
-    rows = c.execute("""
+    where = "WHERE settled = 1"
+    params: tuple = ()
+    if until:
+        where += " AND timestamp < ?"
+        params = (until,)
+    rows = c.execute(f"""
         SELECT timestamp, side, model_prob, price_cents, settlement_result, profit_dollars
-        FROM trades WHERE settled = 1 ORDER BY timestamp
-    """).fetchall()
+        FROM trades {where} ORDER BY timestamp
+    """, params).fetchall()
     c.close()
     out = []
     for ts, side, mp, pc, result, profit in rows:
@@ -45,8 +60,8 @@ def brier(probs, wins):
     return float(np.mean((p - w) ** 2))
 
 
-def main():
-    data = load_trades()
+def main(until: str | None = POSTMORTEM_UNTIL):
+    data = load_trades(until)
     mp = [d[1] for d in data]
     mkt = [d[2] for d in data]
     wins = [d[3] for d in data]
@@ -87,7 +102,8 @@ def main():
     ax1.set_xlim(0, 1); ax1.set_ylim(0, 1)
     ax1.set_xlabel("Claimed probability of the traded side")
     ax1.set_ylabel("Realized win rate")
-    ax1.set_title("Reliability diagram — 92 live trades")
+    ax1.set_title(f"Reliability diagram — {n} live trades"
+                  + (" (postmortem set)" if until else ""))
     ax1.legend(loc="upper left", frameon=False, fontsize=9)
     ax1.text(0.97, 0.04,
              f"Brier  model {b_model:.3f}  vs  market {b_market:.3f}\n"
@@ -119,4 +135,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    ap = argparse.ArgumentParser(description="Postmortem figures from the trade log")
+    ap.add_argument("--until", default=POSTMORTEM_UNTIL,
+                    help=f"only trades before this date (default {POSTMORTEM_UNTIL})")
+    ap.add_argument("--all", action="store_true", help="every settled trade")
+    a = ap.parse_args()
+    main(None if a.all else a.until)

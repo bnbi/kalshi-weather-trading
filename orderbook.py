@@ -185,6 +185,23 @@ def analyze_orderbook(client: KalshiClient, ticker: str,
     return result
 
 
+def fillable_size(analysis: OrderbookAnalysis, side: str, limit_cents: int) -> int:
+    """
+    Contracts that can fill IMMEDIATELY at `limit_cents` for a buy on `side`.
+
+    Buying YES at L matches resting NO bids at 100-L or better (a NO bid at
+    X¢ is a YES offer at 100-X¢); buying NO at L matches YES bids at
+    100-L or better. The old size cap summed the best FIVE levels of the
+    opposite book — depth at prices you were NOT paying — so orders
+    regularly exceeded what could fill and the remainder rested.
+    """
+    levels = analysis.no_levels if side == "yes" else analysis.yes_levels
+    if not levels:
+        return 0
+    floor_price = 100 - limit_cents
+    return int(sum(qty for price, qty in levels if price >= floor_price))
+
+
 def _estimate_slippage(levels: list, order_size: int) -> float:
     """
     Estimate slippage in cents for a given order size.
@@ -297,9 +314,10 @@ if __name__ == "__main__":
 
     print(f"Fetching {city.name} markets...")
     markets = get_market_prices(city.kalshi_series)
+    from find_edge import market_price
     tickers = [m["ticker"] for m in markets
-               if not (float(m.get("yes_ask_dollars", "1")) <= 0.02 or
-                       float(m.get("no_ask_dollars", "1")) <= 0.02)]
+               if not ((market_price(m, "yes_ask") or 1.0) <= 0.02 or
+                       (market_price(m, "no_ask") or 1.0) <= 0.02)]
 
     print(f"Analyzing {len(tickers)} orderbooks...")
     analyses = analyze_markets(client, tickers, args.max_spread, args.min_depth)

@@ -7,10 +7,12 @@
     <string>com.kalshi.weatherbot</string>
 
     <!-- What to run.
-         Paper mode by default (--dry-run): the next-day strategy showed ~zero
-         edge live (see RESEARCH.md), so it runs but places no real orders. To
-         trade real money, remove --dry-run AND ensure config.py + the API key
-         are present. -->
+         This TEMPLATE is paper mode (--dry-run): it runs the full pipeline —
+         settlement checks, re-verification against official GHCND truth,
+         retraining, decision logging — but simulates the orders. To trade
+         real money, remove the --dry-run line AND ensure config.py + the API
+         key are present. (The author's installed copy runs live; keep
+         config.RUN_HOUR equal to the Hour below.) -->
     <key>ProgramArguments</key>
     <array>
         <string>/Users/YOUR_USERNAME/kalshi-bot/venv/bin/python</string>
@@ -27,11 +29,13 @@
     <key>WorkingDirectory</key>
     <string>/Users/YOUR_USERNAME/kalshi-bot</string>
 
-    <!-- Run daily at 10:00 AM local time -->
+    <!-- Run daily at 13:00 local time. Tomorrow's markets and the 12z model
+         runs are available by then; the learning step runs first (~1 min),
+         then trading. Keep config.RUN_HOUR in sync. -->
     <key>StartCalendarInterval</key>
     <dict>
         <key>Hour</key>
-        <integer>10</integer>
+        <integer>13</integer>
         <key>Minute</key>
         <integer>0</integer>
     </dict>

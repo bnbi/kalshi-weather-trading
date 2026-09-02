@@ -527,8 +527,9 @@ async function loadOverview() {
         posEl.innerHTML = '<div class="empty">No open positions</div>';
     } else {
         posEl.innerHTML = `<div class="table-wrap"><table><thead><tr><th>Ticker</th><th>Side</th><th>Qty</th></tr></thead><tbody>${posArr.map(p => {
-            const yes = p.yes_count || 0, no = p.no_count || 0;
-            const side = yes > 0 ? 'yes' : 'no', qty = yes > 0 ? yes : no;
+            // /api/positions derives side/qty from the signed position_fp
+            // (the legacy yes_count/no_count fields no longer exist)
+            const side = p.side || 'no', qty = p.qty != null ? p.qty : 0;
             return `<tr><td style="font-size:11px">${p.ticker}</td><td><span class="badge badge-${side}">${side.toUpperCase()}</span></td><td>${qty}</td></tr>`;
         }).join('')}</tbody></table></div>`;
     }

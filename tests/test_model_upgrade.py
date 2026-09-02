@@ -175,6 +175,8 @@ def _make_training_db(tmp_path, n_days=400):
             month INTEGER, day_of_year INTEGER, model_spread REAL,
             wind_speed_max REAL, humidity_mean REAL, cloud_cover_mean REAL,
             era5_high_f REAL, icon_error REAL,
+            source TEXT DEFAULT 'archive', lead_ok INTEGER DEFAULT 1,
+            actual_source TEXT DEFAULT 'station',
             PRIMARY KEY (date, city))
     """)
     base = datetime(2025, 1, 1)
@@ -332,11 +334,19 @@ def test_all_cities_have_station_ids():
 
 
 def test_scheduler_only_trades_cities_with_models(tmp_path, monkeypatch):
-    """A configured-but-untrained city must never enter the trading rotation."""
+    """A configured-but-untrained city must never enter the trading rotation,
+    and neither may a city whose pickle exists but cannot be loaded (that
+    used to pass the existence check and trade the naive fallback)."""
+    import pickle
     import scheduler
+    from sklearn.linear_model import Ridge
     monkeypatch.setattr(scheduler, "BOT_DIR", tmp_path)
-    (tmp_path / "forecast_model_chicago.pkl").write_bytes(b"x")
-    (tmp_path / "forecast_model_denver.pkl").write_bytes(b"x")
+    good = {"model": Ridge().fit([[80, 80], [90, 90]], [80, 90]),
+            "feature_names": ["gfs", "ecmwf"], "residual_std": 2.0}
+    for city in ("chicago", "denver"):
+        with open(tmp_path / f"forecast_model_{city}.pkl", "wb") as f:
+            pickle.dump(good, f)
+    (tmp_path / "forecast_model_miami.pkl").write_bytes(b"x")  # corrupt
     assert scheduler.tradeable_cities() == ["chicago", "denver"]
 
 
@@ -409,19 +419,21 @@ def test_pct_sizing_full_pipeline_dry_run(monkeypatch):
         expected_value=0.06, description="test")
 
     monkeypatch.setattr(trader, "get_market_prices", lambda s: [{"ticker": "x"}])
-    monkeypatch.setattr(trader, "predict_all_for_city", lambda c, m: [object()])
+    monkeypatch.setattr(trader, "predict_all_for_city", lambda c, m, **k: [object()])
     monkeypatch.setattr(trader, "calculate_edge", lambda p, m, min_edge: [sig])
     monkeypatch.setattr(trader, "filter_tomorrow_only", lambda s, *a, **k: s)
 
-    results = trader.run_trading_pipeline("chicago", dry_run=True)
+    # kelly passed explicitly: the test must not depend on config.py
+    # (absent in CI), which is why it used to fail there.
+    results = trader.run_trading_pipeline("chicago", dry_run=True, kelly_fraction=0.25)
 
     assert len(results) == 1
     order = results[0].order
-    # $100 dry-run bankroll, fee-aware quarter-Kelly: fee(0.70)=2c makes the
-    # all-in cost 72c and net win 28c -> f=0.0536 -> $5.36/$0.72 -> 7
-    # contracts (was 9 when the fee was ignored — that WAS the oversizing)
-    assert order.contracts == 7
-    assert order.cost_dollars == pytest.approx(4.90)
+    # $100 dry-run bankroll, fee-aware quarter-Kelly: fee(0.70)=1.47c makes
+    # the all-in cost 71.5c and net win 28.5c -> f=0.0572 -> $5.72/$0.715
+    # -> 8 contracts (7 with the old rounded-up fee, 9 with no fee)
+    assert order.contracts == 8
+    assert order.cost_dollars == pytest.approx(5.60)
     # position must respect the 8% ceiling of the dry-run bankroll
     assert order.cost_dollars <= 100.0 * 0.08
 
@@ -454,11 +466,10 @@ def test_pct_sizing_scales_with_bankroll():
 
 def test_fee_estimate_matches_kalshi_formula():
     from pnl_tracker import estimate_fee
-    # ceil_to_cent(0.07 * C * P * (1-P)): 2 contracts @ 70c
-    # 0.07*2*0.7*0.3 = 0.0294 -> ceil to $0.03
-    assert estimate_fee(2, 70) == pytest.approx(0.03)
-    assert estimate_fee(1, 50) == pytest.approx(0.02)  # 0.0175 -> 0.02
-    assert estimate_fee(5, 99) == pytest.approx(0.01)  # 0.0035 -> 0.01
+    # exact 0.07 * C * P * (1-P), as charged (ledger: $0.0294 for 2 @ 70c)
+    assert estimate_fee(2, 70) == pytest.approx(0.0294)
+    assert estimate_fee(1, 50) == pytest.approx(0.0175)
+    assert estimate_fee(5, 99) == pytest.approx(0.0035, abs=1e-4)
     assert estimate_fee(1, 0) == 0.0
 
 
@@ -484,8 +495,8 @@ def test_settlement_profit_is_net_of_fees(tmp_path, monkeypatch):
     win = conn.execute("SELECT profit_dollars, fee_dollars FROM trades WHERE ticker='T-WIN'").fetchone()
     assert win[0] == pytest.approx(2.0 - 1.40 - 0.03)   # payout - cost - fee
     loss = conn.execute("SELECT profit_dollars, fee_dollars FROM trades WHERE ticker='T-LOSS'").fetchone()
-    assert loss[1] == pytest.approx(0.02)                # estimated fee
-    assert loss[0] == pytest.approx(-0.50 - 0.02)
+    assert loss[1] == pytest.approx(0.0175)              # estimated fee (exact)
+    assert loss[0] == pytest.approx(-0.50 - 0.0175)
 
 
 def test_summary_growth_metrics(tmp_path):
@@ -728,7 +739,7 @@ def test_no_scaling_when_cap_not_binding():
     orders = trader.size_orders([sig], bankroll=100.0, kelly_fraction=0.25,
         max_position_dollars=8.0, max_contracts=15,
         max_total_dollars=25.0, max_positions=6)
-    assert orders[0].contracts == 7  # fee-aware Kelly (9 when fee ignored)
+    assert orders[0].contracts == 8  # exact-fee Kelly (9 when fee ignored)
 
 
 def test_kelly_fee_reduces_size():
@@ -917,3 +928,337 @@ def test_lead1_revert_restores_lead0_exactly(tmp_path):
     assert row[4] == pytest.approx(0.5)         # error recomputed vs actual
     assert row[5] == pytest.approx(80.9 - 80.2) # spread from restored values
     assert row[6] == 80.5                       # lead0 kept for re-migration
+
+
+# ── execution: size at the limit, cancel unfilled, exposure caps ────
+
+def test_fillable_size_counts_only_levels_at_or_better_than_limit():
+    from orderbook import OrderbookAnalysis, fillable_size
+    a = OrderbookAnalysis(ticker="T")
+    # YES bids (desc): 29c x3, 27c x10  -> NO asks: 71c x3, 73c x10
+    a.yes_levels = [(29, 3), (27, 10)]
+    # NO bids (desc): 65c x4, 60c x6   -> YES asks: 35c x4, 40c x6
+    a.no_levels = [(65, 4), (60, 6)]
+    assert fillable_size(a, "no", 71) == 3     # only the 29c YES bids
+    assert fillable_size(a, "no", 73) == 13    # both levels
+    assert fillable_size(a, "no", 70) == 0     # nothing at or below 70c
+    assert fillable_size(a, "yes", 35) == 4
+    assert fillable_size(a, "yes", 40) == 10
+
+
+class _FillClient:
+    """Kalshi stand-in: orders fill `fills[order_id]` of their count."""
+    def __init__(self, fills):
+        self.fills = fills
+        self.canceled = []
+        self.created = []
+
+    def create_order(self, **kw):
+        oid = f"ord-{len(self.created) + 1}"
+        self.created.append(kw)
+        return {"order": {"order_id": oid, "status": "resting"}}
+
+    def get_order(self, oid):
+        idx = int(oid.split("-")[1]) - 1
+        count = int(self.created[idx]["count"])
+        filled = self.fills.get(oid, 0)
+        status = "executed" if filled >= count else ("canceled" if oid in self.canceled else "resting")
+        price = (self.created[idx].get("no_price") or self.created[idx].get("yes_price")) / 100
+        return {"order": {"order_id": oid, "status": status,
+                          "fill_count_fp": f"{filled:.2f}",
+                          "remaining_count_fp": f"{count - filled:.2f}",
+                          "taker_fill_cost_dollars": f"{filled * price:.4f}",
+                          "maker_fill_cost_dollars": "0",
+                          "taker_fees_dollars": f"{0.07 * filled * price * (1 - price):.4f}",
+                          "maker_fees_dollars": "0"}}
+
+    def cancel_order(self, oid):
+        self.canceled.append(oid)
+        return {}
+
+
+def _order(ticker, side, contracts, price_cents):
+    import trader
+    sig = find_edge.TradeSignal(ticker=ticker, side=side, action="buy",
+                                model_prob=0.8, market_price=price_cents / 100,
+                                edge=0.1, expected_value=0.1, description="t")
+    return trader.TradeOrder(ticker=ticker, side=side, action="buy",
+                             contracts=contracts, price_cents=price_cents,
+                             cost_dollars=contracts * price_cents / 100,
+                             edge=0.1, kelly_fraction=0.05, signal=sig)
+
+
+def test_execute_orders_cancels_unfilled_and_reports_true_fill():
+    import trader
+    client = _FillClient({"ord-1": 6, "ord-2": 1, "ord-3": 0})
+    orders = [_order("A", "no", 6, 66), _order("B", "no", 6, 71), _order("C", "yes", 2, 34)]
+    results = trader.execute_orders(client, orders, dry_run=False,
+                                    fill_wait_seconds=0)
+    full, partial, none = results
+    assert full.filled_contracts == 6 and not full.canceled_remainder
+    assert partial.filled_contracts == 1 and partial.canceled_remainder
+    assert partial.fill_cost_dollars == pytest.approx(0.71)
+    assert none.filled_contracts == 0 and none.canceled_remainder
+    assert client.canceled == ["ord-2", "ord-3"]
+
+
+def test_log_trade_results_records_fills_not_requests(tmp_path):
+    import trader
+    import pnl_tracker as pt
+    conn = sqlite3.connect(tmp_path / "pnl.db")
+    pt.init_pnl_tables(conn)
+    client = _FillClient({"ord-1": 6, "ord-2": 1, "ord-3": 0})
+    orders = [_order("A", "no", 6, 66), _order("B", "no", 6, 71), _order("C", "yes", 2, 34)]
+    results = trader.execute_orders(client, orders, dry_run=False, fill_wait_seconds=0)
+    n = pt.log_trade_results(results, conn)
+    assert n == 2  # the zero-fill order is not a trade
+    rows = conn.execute("SELECT ticker, contracts, cost_dollars, filled_contracts "
+                        "FROM trades ORDER BY ticker").fetchall()
+    assert rows[0] == ("A", 6, pytest.approx(3.96), 6.0)
+    assert rows[1] == ("B", 1, pytest.approx(0.71), 1.0)
+    # the partially-filled 71c order is now a 1-contract position in the
+    # exposure ledger, not a 6-contract one
+    assert pt.open_exposure_dollars(conn) == pytest.approx(3.96 + 0.71)
+
+
+def test_exposure_limits_respect_total_open_cap(monkeypatch):
+    import trader
+    cfg = trader.load_risk_config(0.25)
+    cfg.update({"max_position_pct": 0.08, "max_run_exposure_pct": 0.25,
+                "max_total_exposure_pct": 0.40})
+    # $60 cash with $30 already open: bankroll $90, total cap $36 -> only
+    # $6 of room this run even though the run cap alone would allow $22.50
+    monkeypatch.setattr(trader, "open_exposure_dollars", lambda: 30.0)
+    lim = trader.exposure_limits(60.0, cfg)
+    assert lim["bankroll"] == pytest.approx(90.0)
+    assert lim["run_cap"] == pytest.approx(6.0)
+    # nothing open: run cap is the binding one, never more than cash
+    monkeypatch.setattr(trader, "open_exposure_dollars", lambda: 0.0)
+    lim = trader.exposure_limits(60.0, cfg)
+    assert lim["run_cap"] == pytest.approx(15.0)
+    lim = trader.exposure_limits(10.0, cfg, max_spend=3.0)
+    assert lim["run_cap"] == pytest.approx(2.5)  # 25% of $10, then max_spend
+
+
+def test_existing_positions_include_resting_orders():
+    import trader
+
+    class FakeClient:
+        def get_positions(self, limit=100):
+            return {"market_positions": [{"ticker": "T-HELD", "position_fp": "-6.00"}]}
+        def get_orders(self, ticker=None, status=None, limit=100):
+            assert status == "resting"
+            return {"orders": [{"ticker": "T-RESTING", "status": "resting"}]}
+
+    existing = trader.check_existing_positions(FakeClient(), ["T-HELD", "T-RESTING", "T-NEW"])
+    assert set(existing) == {"T-HELD", "T-RESTING"}
+    assert trader.count_open_positions(FakeClient()) == 2
+
+
+# ── ground truth: migration, re-verification, training filters ─────
+
+def _live_db(tmp_path):
+    """A DB with archive rows and live rows as they exist in production."""
+    import daily_learner
+    from historical_data import init_historical_tables
+    from db_migrations import migrate_db
+    conn = sqlite3.connect(tmp_path / "live.db")
+    daily_learner.init_prediction_log(conn)
+    init_historical_tables(conn)
+    migrate_db(conn)  # adds era5_high_f / *_lead0_f on an empty table
+    # archive row, fully lead-1 (all *_lead0_f preserved) with GHCND truth
+    conn.execute("""INSERT INTO historical_forecasts
+        (date, city, actual_high_f, gfs_forecast_f, ecmwf_forecast_f, blend_forecast_f,
+         icon_forecast_f, month, day_of_year, model_spread, era5_high_f,
+         gfs_lead0_f, ecmwf_lead0_f, blend_lead0_f, icon_lead0_f)
+        VALUES ('2025-06-01','chicago',80,81,82,81,80.5,6,152,1,79,80,80,80,80)""")
+    # archive row still mixed-lead (icon never replaced)
+    conn.execute("""INSERT INTO historical_forecasts
+        (date, city, actual_high_f, gfs_forecast_f, ecmwf_forecast_f, blend_forecast_f,
+         icon_forecast_f, month, day_of_year, model_spread, era5_high_f,
+         gfs_lead0_f, ecmwf_lead0_f, blend_lead0_f)
+        VALUES ('2025-06-02','chicago',80,81,82,81,80.5,6,153,1,79,80,80,80)""")
+    # live row recorded the day before (lead 1) verified from the obs FEED;
+    # the training copy was overwritten by the Previous Runs backfill
+    conn.execute("""INSERT INTO daily_predictions
+        (date, city, gfs_forecast_f, ecmwf_forecast_f, blend_forecast_f, icon_forecast_f,
+         model_prediction_f, actual_high_f, model_error, recorded_at)
+        VALUES ('2026-08-20','chicago',85,84,85,86,85.5,84.2,1.3,'2026-08-19T17:00:00+00:00')""")
+    conn.execute("""INSERT INTO historical_forecasts
+        (date, city, actual_high_f, gfs_forecast_f, ecmwf_forecast_f, blend_forecast_f,
+         icon_forecast_f, month, day_of_year, model_spread,
+         gfs_lead0_f, ecmwf_lead0_f, blend_lead0_f, icon_lead0_f)
+        VALUES ('2026-08-20','chicago',84.2,83,83,83,83,8,232,0,85,84,85,86)""")
+    # live row recorded on the day itself (lead 0)
+    conn.execute("""INSERT INTO daily_predictions
+        (date, city, gfs_forecast_f, ecmwf_forecast_f, blend_forecast_f,
+         actual_high_f, recorded_at)
+        VALUES ('2026-08-21','chicago',88,87,88,87.8,'2026-08-21T17:00:00+00:00')""")
+    conn.commit()
+    return conn
+
+
+def test_migration_tags_provenance_and_restores_live_forecasts(tmp_path):
+    from db_migrations import migrate_db
+    conn = _live_db(tmp_path)
+    migrate_db(conn)
+    rows = {r[0]: r[1:] for r in conn.execute(
+        "SELECT date, source, lead_ok, actual_source, gfs_forecast_f, lead_days "
+        "FROM historical_forecasts WHERE city='chicago'")}
+    assert rows["2025-06-01"][:3] == ("archive", 1, "station")
+    assert rows["2025-06-02"][:3] == ("archive", 0, "station")   # mixed lead
+    live = rows["2026-08-20"]
+    assert live[0] == "live" and live[1] == 1 and live[4] == 1
+    assert live[3] == 85            # live GFS restored over the archive value
+    assert live[2] is None          # feed truth is NOT labelled official
+    lead0 = conn.execute("SELECT lead_days FROM daily_predictions WHERE date='2026-08-21'").fetchone()[0]
+    assert lead0 == 0
+    assert migrate_db(conn) == {"daily_predictions.lead_days": 0}  # idempotent
+
+
+def test_training_uses_only_official_lead1_rows(tmp_path):
+    from db_migrations import migrate_db
+    import train_model
+    conn = _live_db(tmp_path)
+    migrate_db(conn)
+    df = train_model.load_training_data(conn, "chicago")
+    # the mixed-lead archive row and the feed-verified live row are excluded
+    assert list(df["date"].dt.strftime("%Y-%m-%d")) == ["2025-06-01"]
+
+
+def test_reverify_replaces_feed_with_ghcnd_and_syncs_training(tmp_path, monkeypatch):
+    from db_migrations import migrate_db
+    import daily_learner
+    conn = _live_db(tmp_path)
+    migrate_db(conn)
+    monkeypatch.setattr(daily_learner, "fetch_ghcnd_daily_highs",
+                        lambda city, start, end: {"2026-08-20": 86.0})
+    monkeypatch.setattr(daily_learner, "_local_today", lambda c: "2026-09-02")
+    fixed = daily_learner.reverify_provisional(conn, "chicago")
+    assert fixed == 1
+    row = conn.execute("SELECT actual_high_f, actual_source, model_error "
+                       "FROM daily_predictions WHERE date='2026-08-20'").fetchone()
+    assert row == (86.0, "station", pytest.approx(85.5 - 86.0))
+    tr = conn.execute("SELECT actual_high_f, actual_source, lead_ok, gfs_error "
+                      "FROM historical_forecasts WHERE date='2026-08-20'").fetchone()
+    assert tr == (86.0, "station", 1, pytest.approx(85 - 86.0))
+    # the lead-0 day stays out of the training set even once official
+    monkeypatch.setattr(daily_learner, "fetch_ghcnd_daily_highs",
+                        lambda city, start, end: {"2026-08-21": 88.0})
+    daily_learner.reverify_provisional(conn, "chicago")
+    assert conn.execute("SELECT COUNT(*) FROM historical_forecasts WHERE date='2026-08-21'").fetchone()[0] == 0
+
+
+def test_verify_records_feed_as_provisional(tmp_path, monkeypatch):
+    import daily_learner
+    conn = sqlite3.connect(tmp_path / "v.db")
+    daily_learner.init_prediction_log(conn)
+    conn.execute("""INSERT INTO daily_predictions (date, city, gfs_forecast_f, recorded_at)
+                    VALUES ('2026-09-01','nyc',80,'2026-08-31T17:00:00+00:00')""")
+    conn.commit()
+    monkeypatch.setattr(daily_learner, "fetch_station_daily_high_with_source",
+                        lambda c, d: (81.4, "feed"))
+    r = daily_learner.verify_yesterday(conn, "nyc", "2026-09-01")
+    assert r["source"] == "feed"
+    assert conn.execute("SELECT actual_source FROM daily_predictions").fetchone()[0] == "feed"
+    # provisional truth is never promoted into the training set
+    assert daily_learner.add_to_training_data(conn, "nyc", "2026-09-01") is False
+
+
+def test_live_calibration_rescored_with_current_model(tmp_path, monkeypatch):
+    """The live bias window must describe the CURRENT model on OFFICIAL
+    days: re-score stored inputs, skip feed/ERA5 days and lead-0 days."""
+    import pickle
+    import weather_ensemble as we
+    from sklearn.linear_model import Ridge
+    from db_migrations import migrate_db
+    import daily_learner
+
+    conn = sqlite3.connect(tmp_path / "cal.db")
+    daily_learner.init_prediction_log(conn)
+    migrate_db(conn)
+    rows = []
+    for i in range(1, 16):
+        src = "station" if i <= 12 else "feed"
+        rows.append((f"2026-08-{i:02d}", "chicago", 80.0, 80.0, 80.0, 80.0, 83.0, src,
+                     f"2026-08-{i-1:02d}T17:00:00+00:00" if i > 1 else "2026-07-31T17:00:00+00:00", 1))
+    conn.executemany("""INSERT INTO daily_predictions
+        (date, city, gfs_forecast_f, ecmwf_forecast_f, blend_forecast_f, icon_forecast_f,
+         actual_high_f, actual_source, recorded_at, lead_days) VALUES (?,?,?,?,?,?,?,?,?,?)""", rows)
+    conn.commit()
+
+    # a "current model" that predicts gfs + 1 exactly
+    m = Ridge(alpha=1e-6).fit([[70, 70], [80, 80], [90, 90], [100, 100]], [71, 81, 91, 101])
+    md = {"model": m, "feature_names": ["gfs", "mean_forecast"], "residual_std": 2.0,
+          "model_name": "Ridge", "train_mae": 1.0, "trained_date": "now"}
+    with open(tmp_path / "forecast_model_chicago.pkl", "wb") as f:
+        pickle.dump(md, f)
+    monkeypatch.setattr(we, "BOT_DIR", str(tmp_path))
+    monkeypatch.setattr(we, "DB_PATH", tmp_path / "cal.db")
+    monkeypatch.setattr(we, "_dynamic_exclusions", lambda c: set())
+
+    errs = we.live_calibration_errors("chicago")
+    assert len(errs) == 12                       # feed days excluded
+    assert all(abs(e - (81.0 - 83.0)) < 1e-6 for e in errs)  # current model, not stored proxy
+
+    ens = we.EnsembleForecast(city="Chicago", date="2026-09-03")
+    bias, sd, n = ens._get_live_calibration()
+    assert n == 12 and bias == pytest.approx(-2.0, abs=1e-6)
+
+
+def test_ensemble_sigma_no_spread_stacking_with_day_sigma(monkeypatch):
+    """With a per-day σ model, spread must not be added a second time."""
+    import weather_ensemble as we
+    ens = we.EnsembleForecast(city="Chicago", date="2026-09-03")
+    ens.sources = [we.ForecastSource("OpenMeteo/gfs", 80.0),
+                   we.ForecastSource("OpenMeteo/ecmwf", 88.0),
+                   we.ForecastSource("OpenMeteo/best_match", 80.0)]
+    monkeypatch.setattr(we.EnsembleForecast, "_predict_with_trained_model",
+                        lambda self: {"predicted_high": 82.0, "uncertainty_std": 2.4,
+                                      "has_sigma_model": True, "features": {},
+                                      "trained_date": "x"})
+    monkeypatch.setattr(we.EnsembleForecast, "_get_live_calibration",
+                        lambda self: (0.5, 2.0, 30))
+    monkeypatch.setattr(we.EnsembleForecast, "_apply_weatherkit_blend", lambda self: None)
+    ens.compute()
+    assert ens.model_spread == 8.0
+    assert ens.ensemble_std == pytest.approx(2.4)      # max(2.0, 2.4, 1.8), no +2.0
+    assert ens.ensemble_high_f == pytest.approx(81.5)  # raw 82 minus +0.5 bias
+    assert ens.bias_applied_f == pytest.approx(0.5)
+
+
+def test_la_ecmwf_is_excluded_everywhere():
+    from weather import CITIES
+    import weather_ensemble as we
+    assert "ecmwf" in CITIES["la"].excluded_sources
+    g, e, b = we.impute_core_sources(75.0, None, 76.0)
+    assert e == pytest.approx(75.5)   # imputed like a missing source
+    assert we.impute_core_sources(75.0, None, None) == (None, None, None)
+
+
+def test_sniper_verify_prefers_exchange_result_and_grades_below_thresholds(tmp_path):
+    import sniper
+    conn = sqlite3.connect(tmp_path / "s.db")
+    sniper.init_sniper_table(conn)
+    conn.execute("""CREATE TABLE daily_predictions
+                    (date TEXT, city TEXT, actual_high_f REAL, actual_source TEXT)""")
+    # "<80" threshold, official high 85 -> YES loses, so a NO signal WINS
+    conn.execute("""INSERT INTO sniper_signals
+        (created_at,date,city,ticker,side,prob,ask_price,mode,strike_type)
+        VALUES('x','2026-08-20','nyc','KXHIGHNY-26AUG20-T80','no',0.9,0.80,'dry','less')""")
+    conn.execute("""INSERT INTO sniper_signals
+        (created_at,date,city,ticker,side,prob,ask_price,mode)
+        VALUES('x','2026-08-20','nyc','KXHIGHNY-26AUG20-B88.5','no',0.9,0.70,'dry')""")
+    conn.execute("INSERT INTO daily_predictions VALUES('2026-08-20','nyc',85.0,'station')")
+    conn.commit()
+
+    class FakeClient:
+        def get_market(self, ticker):
+            if ticker.endswith("B88.5"):
+                return {"market": {"status": "settled", "result": "yes"}}  # exchange says YES
+            return {"market": {"status": "active", "result": ""}}       # not settled
+    assert sniper.verify_signals(conn, client=FakeClient()) == 2
+    rows = {r[0]: r[1:] for r in conn.execute(
+        "SELECT ticker, outcome, truth_source FROM sniper_signals")}
+    assert rows["KXHIGHNY-26AUG20-B88.5"] == ("loss", "kalshi")   # exchange result wins
+    assert rows["KXHIGHNY-26AUG20-T80"] == ("win", "station")     # graded as a BELOW contract

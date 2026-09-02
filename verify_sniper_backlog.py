@@ -1,10 +1,11 @@
 """
 Sniper Signal Verification Backfill
 
-Scores every unverified sniper signal against the OFFICIAL settlement-station
-daily high (NOAA GHCND / NWS obs), using the same settlement logic as
-sniper.verify_signals. Unblocks the self-validation gate, which can only
-accumulate evidence from verified signals.
+Grades every unverified sniper signal with sniper.verify_signals — the
+exchange's own settlement result where the market is still fetchable,
+otherwise the official GHCND daily high (direction-aware for thresholds)
+— then prints the validation-gate status. The grading logic used to be
+duplicated here with a bug (every threshold graded as "above").
 
     python verify_sniper_backlog.py
 """
@@ -12,64 +13,23 @@ accumulate evidence from verified signals.
 from __future__ import annotations
 
 import sqlite3
-import time
-
-from sniper import parse_contract_ticker, validation_status, VALIDATION_MIN_SIGNALS
-from station_obs import fetch_station_daily_high
-from find_edge import kalshi_fee_per_contract
-
 from pathlib import Path
+
+from sniper import (init_sniper_table, verify_signals, validation_status,
+                    VALIDATION_MIN_SIGNALS)
+from db_migrations import migrate_db
+
 DB_PATH = str(Path(__file__).parent / "kalshi_data.db")
 
 
 def main():
     conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute("""
-        SELECT id, date, city, ticker, side, ask_price
-        FROM sniper_signals
-        WHERE outcome IS NULL
-        ORDER BY date
-    """).fetchall()
-
-    print(f"Unverified signals: {len(rows)}")
-
-    # Fetch each needed (city, date) actual only once
-    needed = sorted({(city, date) for _, date, city, _, _, _ in rows})
-    actuals = {}
-    for city, date in needed:
-        high = fetch_station_daily_high(city, date)
-        actuals[(city, date)] = high
-        status = f"{high}°F" if high is not None else "unavailable"
-        print(f"  {city} {date}: {status}")
-        time.sleep(0.3)
-
-    verified = 0
-    for sid, date, city, ticker, side, ask in rows:
-        actual = actuals.get((city, date))
-        if actual is None:
-            continue
-
-        info = parse_contract_ticker(ticker)
-        high = round(actual)
-        if info["type"] == "threshold":
-            yes_settled = high > info["threshold"]
-        elif info["type"] == "bracket":
-            yes_settled = info["bracket_low"] <= high <= info["bracket_high"]
-        else:
-            continue
-
-        won = yes_settled if side == "yes" else not yes_settled
-        # Net of the exchange fee, matching sniper.verify_signals — the
-        # validation gate must be graded on live economics.
-        fee = kalshi_fee_per_contract(ask)
-        profit = (1 - ask - fee) if won else (-ask - fee)
-        conn.execute("""
-            UPDATE sniper_signals SET outcome = ?, hypo_profit = ?
-            WHERE id = ?
-        """, ("win" if won else "loss", profit, sid))
-        verified += 1
-
-    conn.commit()
+    init_sniper_table(conn)
+    migrate_db(conn)
+    before = conn.execute(
+        "SELECT COUNT(*) FROM sniper_signals WHERE outcome IS NULL").fetchone()[0]
+    print(f"Unverified signals: {before}")
+    verified = verify_signals(conn)
     print(f"\nVerified {verified} signal(s)")
 
     s = validation_status(conn)
@@ -81,6 +41,7 @@ def main():
               f"(claimed avg: {s['avg_claimed_prob']:.0%})")
         print(f"  Hypothetical P&L: ${s['hypo_profit'] or 0:+.2f} "
               f"on ${s['hypo_staked'] or 0:.2f} staked")
+        print(f"  Brier: model {s['brier_model']:.3f} vs market {s['brier_market']:.3f}")
     gate_msg = ("PASSED — sniper will trade live in --auto mode"
                 if s["passed"] else "not passed — sniper stays in dry-run")
     print(f"  GATE {gate_msg}")

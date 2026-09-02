@@ -3,7 +3,10 @@ Export sanitized CSVs so the RESEARCH.md numbers are reproducible by a reviewer
 without exposing the live SQLite DB or any account identifiers.
 
 Drops order ids and timestamps-to-the-second; keeps everything needed to
-recompute calibration, Brier scores, and P&L.
+recompute calibration, Brier scores, and P&L. Sniper rows carry both the
+outcome graded on real settlement (`outcome`, `truth_source`) and the
+pre-Sep-2026 outcome that was graded on reanalysis/obs-feed values
+(`legacy_outcome`), so the re-grading is itself reproducible.
 
 Usage:  python export_data.py     # writes data/live_trades.csv, data/sniper_signals.csv
 """
@@ -40,12 +43,12 @@ def main():
     )
     n2 = export(
         """SELECT date, city, ticker, side, prob, ask_price, obs_max_f, rem_max_f,
-                  hours_remaining, mode, outcome, hypo_profit,
-                  COALESCE(model_version, 'legacy') AS model_version
+                  hours_remaining, mode, outcome, truth_source, legacy_outcome,
+                  hypo_profit, COALESCE(model_version, 'legacy') AS model_version
            FROM sniper_signals ORDER BY id""",
         ["date", "city", "ticker", "side", "prob", "ask_price", "obs_max_f",
-         "rem_max_f", "hours_remaining", "mode", "outcome", "hypo_profit",
-         "model_version"],
+         "rem_max_f", "hours_remaining", "mode", "outcome", "truth_source",
+         "legacy_outcome", "hypo_profit", "model_version"],
         "sniper_signals.csv",
     )
     print(f"wrote data/live_trades.csv ({n1} rows), data/sniper_signals.csv ({n2} rows)")

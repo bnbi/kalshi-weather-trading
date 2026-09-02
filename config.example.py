@@ -18,12 +18,49 @@ KALSHI_DEMO_URL = "https://demo-api.kalshi.co/trade-api/v2"
 # Start with demo mode — switch to production only when you're confident
 USE_DEMO = True
 
-# Risk parameters — percentage-based, scale with bankroll automatically
+# ── Schedule ───────────────────────────────────────────────────────
+# Local hour of the daily launchd run. Keep in sync with the installed
+# com.kalshi.weatherbot.plist; status displays and `scheduler.py daemon`
+# derive "next run" from this.
+RUN_HOUR = 13
+
+# ── Sizing mode ────────────────────────────────────────────────────
+# "global"   — signals from all cities pooled, sized best-edge-first
+#              under one run budget (bigger, Kelly-true bets).
+# "per_city" — the pre-2026-09-01 behavior: run budget split evenly
+#              across cities (smaller bets).
+SIZING_MODE = "global"
+MAX_CONTRACTS_PER_ORDER = 15     # per-order cap; the binding limits are the
+                                 # % position cap and fillable book size
+
+# Risk parameters — percentage-based, scale with bankroll automatically.
+# "Bankroll" = cash + cost of everything still open (both strategies).
 KELLY_FRACTION = 0.25            # quarter-Kelly per trade
 MAX_POSITION_PCT = 0.08          # max 8% of bankroll on any one position
-MAX_RUN_EXPOSURE_PCT = 0.25     # max 25% of bankroll deployed per run
-MAX_OPEN_POSITIONS = 10          # max TOTAL simultaneous open positions
+MAX_RUN_EXPOSURE_PCT = 0.25      # max 25% of bankroll deployed per run
+MAX_TOTAL_EXPOSURE_PCT = 0.40    # max 40% of bankroll open at once across
+                                 # ALL runs of both strategies (the sniper
+                                 # fires hourly; without this, 25%/run could
+                                 # compound to half the bankroll at risk)
+MAX_OPEN_POSITIONS = 6           # max TOTAL simultaneous open positions —
+                                 # resting orders count; slots held come off
+                                 # each run's allowance (both strategies)
 MIN_EDGE_CENTS = 5               # live edge threshold (blended, net of fees)
+
+# ── Execution ──────────────────────────────────────────────────────
+# Orders are limit orders AT the ask, sized to what can fill at that
+# price. Anything still unfilled after FILL_WAIT_SECONDS is canceled: a
+# resting order fills exactly when the market moves against the model.
+FILL_WAIT_SECONDS = 20
+# Post inside the spread instead of taking the ask. Off by default — the
+# fee-net edge already assumes paying the ask, and an improved order is
+# adversely selected. (Unfilled improved orders are still canceled.)
+IMPROVE_PRICES = False
+
+# ── Probability layer ──────────────────────────────────────────────
+# Live bias correction (°F) is clipped to ±MAX_BIAS_CORRECTION. The live
+# window re-scores the CURRENT model on days with OFFICIAL (GHCND) actuals.
+MAX_BIAS_CORRECTION = 3.0
 
 # ── Apple WeatherKit (optional 5th forecast source) ──────────────
 # From https://developer.apple.com/account:

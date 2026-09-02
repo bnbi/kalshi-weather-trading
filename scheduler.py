@@ -34,6 +34,7 @@ import os
 import sys
 import time
 import logging
+from contextlib import redirect_stdout
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -44,9 +45,15 @@ KILL_SWITCH_FILE = BOT_DIR / "KILL_SWITCH"
 LOG_DIR = BOT_DIR / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
-# Hour of the daily launchd run (com.kalshi.weatherbot.plist). Keep in sync
-# with the plist — status displays derive "next run" from this.
-RUN_HOUR = 10
+# Hour of the daily launchd run (com.kalshi.weatherbot.plist). Set
+# config.RUN_HOUR to match the installed plist — status displays and the
+# daemon derive "next run" from this. (The installed job has been firing at
+# 13:00 local while the repo plist said 10:00.)
+try:
+    from config import RUN_HOUR as _cfg_run_hour
+    RUN_HOUR = int(_cfg_run_hour)
+except Exception:
+    RUN_HOUR = 13
 
 # Per-day trader logs older than this are pruned on each run.
 LOG_RETENTION_DAYS = 60
@@ -57,9 +64,26 @@ CITIES_ALL = list(_CITIES.keys())
 
 
 def tradeable_cities() -> list:
-    """Cities that have a trained forecast model on disk."""
-    return [c for c in CITIES_ALL
-            if (BOT_DIR / f"forecast_model_{c}.pkl").exists()]
+    """
+    Cities whose trained forecast model is on disk AND loads. A pickle that
+    exists but fails to unpickle (library mismatch, partial write) used to
+    pass this check and silently trade the naive-average fallback.
+    """
+    out = []
+    for c in CITIES_ALL:
+        path = BOT_DIR / f"forecast_model_{c}.pkl"
+        if not path.exists():
+            continue
+        try:
+            from train_model import load_model
+            md = load_model(str(path))
+            if "model" in md and "feature_names" in md:
+                out.append(c)
+            else:
+                print(f"  Warning: {path.name} is missing model data — city skipped")
+        except Exception as e:
+            print(f"  Warning: {path.name} failed to load ({e}) — city skipped")
+    return out
 
 
 # ── Logging setup ──────────────────────────────────────────────────
@@ -181,10 +205,20 @@ def default_min_edge() -> float:
 
 
 def run_once(cities: list[str] = None, max_spend: float = None,
-             min_edge: float = None):
+             min_edge: float = None, dry_run: bool = False):
     """
     Execute one trading run across specified cities.
     Checks kill switch first.
+
+    Order of operations (changed 2026-09):
+      settlements → verify/re-verify + retrain → TRADE → record forecasts
+    Learning used to run after trading, so every decision used a model and
+    a calibration window that were one day staler than necessary; the
+    whole learning step takes well under a minute now.
+
+    dry_run: paper mode. Still runs settlement checks (if credentials
+    exist) and the full learning cycle — a paper deployment must keep
+    learning, or its models and calibration silently freeze.
     """
     logger = setup_logging()
     if min_edge is None:
@@ -196,7 +230,7 @@ def run_once(cities: list[str] = None, max_spend: float = None,
                     f"{LOG_RETENTION_DAYS} days")
 
     logger.info("=" * 50)
-    logger.info("SCHEDULED TRADING RUN STARTING")
+    logger.info(f"SCHEDULED TRADING RUN STARTING{' (DRY RUN)' if dry_run else ''}")
     logger.info("=" * 50)
 
     # CHECK KILL SWITCH FIRST
@@ -205,95 +239,118 @@ def run_once(cities: list[str] = None, max_spend: float = None,
         logger.warning(f"To resume: python scheduler.py --resume")
         return
 
+    # Import here so kill switch check happens before any API calls
+    from pnl_tracker import check_settlements, init_pnl_tables, print_summary
+    from daily_learner import learn, record, init_prediction_log
+    from db_migrations import migrate_db
+    from historical_data import init_historical_tables
+    import sqlite3
+
+    # Step 1: Check settlements from yesterday's trades (needs credentials)
+    logger.info("Checking for settled markets...")
+    try:
+        pnl_conn = sqlite3.connect(str(Path(__file__).parent / "kalshi_data.db"))
+        init_pnl_tables(pnl_conn)
+        migrate_db(pnl_conn, verbose=True)
+        with redirect_stdout(_LoggerWriter(logger)):
+            # True-up fills BEFORE scoring: resting maker orders may have
+            # filled partially, fully, or not at all since the last run.
+            from pnl_tracker import reconcile_fills
+            reconcile_fills(pnl_conn)
+            settled = check_settlements(pnl_conn)
+            if settled > 0:
+                logger.info(f"  Settled {settled} trade(s) from previous days")
+                print_summary(pnl_conn)
+            # Score guardrail-rejected signals against settled results so the
+            # filters themselves stay falsifiable (see pnl_tracker skipped).
+            from pnl_tracker import verify_skipped_signals
+            verify_skipped_signals(pnl_conn)
+        pnl_conn.close()
+    except Exception as e:
+        logger.warning(f"  Could not check settlements: {e}")
+
+    # Step 2: Learn FIRST — re-verify against official truth, verify recent
+    # days, retrain — so today's decisions use today's best model.
+    learn_cities = CITIES_ALL  # every city keeps accumulating data
+    logger.info("Running learning cycle (verify → retrain) before trading...")
+    try:
+        conn = sqlite3.connect(str(Path(__file__).parent / "kalshi_data.db"))
+        init_prediction_log(conn)
+        init_historical_tables(conn)
+        migrate_db(conn, verbose=True)
+        with redirect_stdout(_LoggerWriter(logger)):
+            learn(conn, learn_cities, retrain=True)
+            # A model file that exists but will not load (library mismatch,
+            # partial write) must be rebuilt here, on this machine, rather
+            # than silently dropping the city from the rotation.
+            from daily_learner import retrain_model
+            from train_model import load_model
+            for c in learn_cities:
+                path = BOT_DIR / f"forecast_model_{c}.pkl"
+                if not path.exists():
+                    continue
+                try:
+                    load_model(str(path))
+                except Exception as e:
+                    print(f"  [{c}] model file unreadable ({e}) — retraining")
+                    retrain_model(conn, c)
+        conn.close()
+    except Exception as e:
+        logger.warning(f"  Learning cycle failed: {e}")
+
     if cities is None:
         # Trade every configured city that has a trained model. New cities
         # enter the rotation automatically once backfill_history.py has
         # bootstrapped their data and trained a model — never before, so an
         # untrained naive-average forecast can never place real orders.
-        # (NYC re-enabled 2026-08-02: retrained on station truth it scores
-        # 1.10°F MAE vs 1.31 baseline — the earlier "no edge" verdict was
-        # an artifact of grading against ERA5.)
         cities = tradeable_cities()
         skipped = [c for c in CITIES_ALL if c not in cities]
         if skipped:
             logger.info(f"  Cities awaiting trained models (run "
                         f"backfill_history.py): {skipped}")
 
-    # Import here so kill switch check happens before any API calls
-    from trader import run_trading_pipeline
-    from pnl_tracker import check_settlements, init_pnl_tables, print_summary
-    from daily_learner import run_daily_learning
-    from kalshi_client import create_client_from_config
+    # Step 3: Pre-flight balance check (live only)
+    if not dry_run:
+        try:
+            from kalshi_client import create_client_from_config
+            client = create_client_from_config()
+            balance = client.get_balance()
+            available = balance.get("balance", 0) / 100  # API returns cents
+            logger.info(f"  Account balance: ${available:.2f}")
+        except Exception as e:
+            logger.error(f"  Could not fetch balance: {e}")
+            logger.error(f"  Aborting run for safety.")
+            return
 
-    # Step 1: Check settlements from yesterday's trades
-    logger.info("Checking for settled markets...")
-    try:
-        import sqlite3
-        pnl_conn = sqlite3.connect(str(Path(__file__).parent / "kalshi_data.db"))
-        init_pnl_tables(pnl_conn)
-        # True-up fills BEFORE scoring: resting maker orders may have
-        # filled partially, fully, or not at all since the last run.
-        from pnl_tracker import reconcile_fills
-        reconcile_fills(pnl_conn)
-        settled = check_settlements(pnl_conn)
-        if settled > 0:
-            logger.info(f"  Settled {settled} trade(s) from previous days")
-            print_summary(pnl_conn)
-        # Score guardrail-rejected signals against settled results so the
-        # filters themselves stay falsifiable (see pnl_tracker skipped).
-        from pnl_tracker import verify_skipped_signals
-        verify_skipped_signals(pnl_conn)
-        pnl_conn.close()
-    except Exception as e:
-        logger.warning(f"  Could not check settlements: {e}")
+    # Step 4: Trade
+    total_results = _execute_trading(cities, max_spend, min_edge, logger,
+                                     dry_run=dry_run)
 
-    # Step 2: Pre-flight balance check — cap total spend to available balance
-    # (Trade FIRST, retrain AFTER — retraining takes ~45 min and would delay orders)
-    try:
-        client = create_client_from_config()
-        balance = client.get_balance()
-        available = balance.get("balance", 0) / 100  # API returns cents
-        logger.info(f"  Account balance: ${available:.2f}")
-
-        # Budget is computed inside the global pipeline as a percentage
-        # of the live bankroll; --max-spend still overrides as a ceiling.
-    except Exception as e:
-        logger.error(f"  Could not fetch balance: {e}")
-        logger.error(f"  Aborting run for safety.")
-        return
-
-    total_results = _execute_trading(cities, max_spend, min_edge, logger)
-
-    # If we ran before 6:30am and placed 0 orders, tomorrow's markets
-    # probably aren't posted yet.  Wait until 7am and retry once.
-    now = datetime.now()
     successes = [r for r in total_results if r.success]
-    if len(successes) == 0 and now.hour < 7:
-        target = now.replace(hour=7, minute=0, second=0, microsecond=0)
-        wait_seconds = (target - now).total_seconds()
-        logger.info(f"\n  No orders placed and it's before 7am.")
-        logger.info(f"  Tomorrow's markets may not be posted yet.")
-        logger.info(f"  Waiting {int(wait_seconds)}s until 7:00am to retry...")
-        time.sleep(wait_seconds)
-
-        logger.info("\n  RETRYING at 7:00am...")
-        total_results = _execute_trading(cities, max_spend, min_edge, logger)
-        successes = [r for r in total_results if r.success]
-
     logger.info(f"\nRUN COMPLETE: {len(successes)} orders placed across {len(cities)} cities")
-    total_spent = sum(r.order.cost_dollars for r in total_results if r.success)
+    total_spent = sum(_filled_cost(r) for r in successes)
     if successes:
         logger.info(f"  Total spent: ${total_spent:.2f}")
 
-    # Step 4: Daily learning — verify yesterday, retrain, record today
-    # (Runs AFTER trading so orders aren't delayed by ~45 min of retraining)
-    logger.info("Running daily learning cycle...")
+    # Step 5: Record today's/tomorrow's forecasts for later verification
+    logger.info("Recording forecasts for verification...")
     try:
-        # Learn on ALL configured cities (including ones not yet trading)
-        # so every city keeps accumulating verified data.
-        run_daily_learning(CITIES_ALL)
+        conn = sqlite3.connect(str(Path(__file__).parent / "kalshi_data.db"))
+        init_prediction_log(conn)
+        migrate_db(conn)
+        with redirect_stdout(_LoggerWriter(logger)):
+            record(conn, CITIES_ALL)
+        conn.close()
     except Exception as e:
-        logger.warning(f"  Daily learning failed: {e}")
+        logger.warning(f"  Recording forecasts failed: {e}")
+
+
+def _filled_cost(r) -> float:
+    try:
+        from trader import filled_cost
+        return filled_cost(r)
+    except Exception:
+        return r.order.cost_dollars
 
 
 class _LoggerWriter:
@@ -322,14 +379,14 @@ class _LoggerWriter:
 
 
 def _execute_trading(cities: list[str], max_spend: float,
-                     min_edge: float, logger: logging.Logger) -> list:
+                     min_edge: float, logger: logging.Logger,
+                     dry_run: bool = False) -> list:
     """
     Execute one trading pass. SIZING_MODE in config.py selects:
       "global"   — pooled cross-city sizing (default)
       "per_city" — legacy even split, the proven-but-small Aug 18-31
                    behavior (the one-line revert switch)
     """
-    from contextlib import redirect_stdout
     from trader import run_global_pipeline
 
     try:
@@ -337,20 +394,22 @@ def _execute_trading(cities: list[str], max_spend: float,
     except ImportError:
         SIZING_MODE = "global"
     if SIZING_MODE == "per_city":
-        return _execute_trading_per_city(cities, max_spend, min_edge, logger)
+        return _execute_trading_per_city(cities, max_spend, min_edge, logger,
+                                         dry_run=dry_run)
 
     total_results = []
-    logger.info(f"\n--- Trading {len(cities)} cities (global sizing) ---")
+    logger.info(f"\n--- Trading {len(cities)} cities (global sizing"
+                f"{', DRY RUN' if dry_run else ''}) ---")
     try:
         with redirect_stdout(_LoggerWriter(logger)):
             total_results = run_global_pipeline(
                 city_keys=cities,
-                dry_run=False,
+                dry_run=dry_run,
                 min_edge=min_edge,
                 tomorrow_only=True,
                 max_spend=max_spend,
             )
-        total_spent = sum(r.order.cost_dollars for r in total_results if r.success)
+        total_spent = sum(_filled_cost(r) for r in total_results if r.success)
         if total_spent:
             logger.info(f"  Spent ${total_spent:.2f} this run")
 
@@ -370,10 +429,10 @@ def _execute_trading(cities: list[str], max_spend: float,
 
 
 def _execute_trading_per_city(cities: list[str], max_spend: float,
-                              min_edge: float, logger: logging.Logger) -> list:
+                              min_edge: float, logger: logging.Logger,
+                              dry_run: bool = False) -> list:
     """Legacy per-city budget split (pre-2026-09-01). Kept as the revert
     path: proven Aug 18-31 live record, smaller bets."""
-    from contextlib import redirect_stdout
     from trader import run_trading_pipeline
     from kalshi_client import create_client_from_config
 
@@ -381,12 +440,15 @@ def _execute_trading_per_city(cities: list[str], max_spend: float,
         from config import MAX_RUN_EXPOSURE_PCT as _pct
     except ImportError:
         _pct = 0.25
-    try:
-        client = create_client_from_config()
-        available = client.get_balance().get("balance", 0) / 100
-    except Exception as e:
-        logger.error(f"  Could not fetch balance for per-city split: {e}")
-        return []
+    if dry_run:
+        available = 100.0
+    else:
+        try:
+            client = create_client_from_config()
+            available = client.get_balance().get("balance", 0) / 100
+        except Exception as e:
+            logger.error(f"  Could not fetch balance for per-city split: {e}")
+            return []
 
     total_budget = available * _pct
     if max_spend is not None:
@@ -407,10 +469,10 @@ def _execute_trading_per_city(cities: list[str], max_spend: float,
         try:
             with redirect_stdout(_LoggerWriter(logger)):
                 results = run_trading_pipeline(
-                    city_key=city, dry_run=False, max_spend=city_budget,
+                    city_key=city, dry_run=dry_run, max_spend=city_budget,
                     min_edge=min_edge, tomorrow_only=True)
             total_results.extend(results)
-            total_spent += sum(r.order.cost_dollars for r in results if r.success)
+            total_spent += sum(_filled_cost(r) for r in results if r.success)
             failures = [r for r in results if not r.success]
             if failures:
                 logger.error(f"  {len(failures)} order(s) FAILED for {city}")
@@ -423,12 +485,14 @@ def _execute_trading_per_city(cities: list[str], max_spend: float,
     return total_results
 
 
-def run_daemon(run_hour: int = 7, cities: list[str] = None,
+def run_daemon(run_hour: int = None, cities: list[str] = None,
                max_spend: float = None):
     """
     Run continuously, executing trades once per day at run_hour (local time).
     Useful if you don't want to set up cron.
     """
+    if run_hour is None:
+        run_hour = RUN_HOUR
     logger = setup_logging()
     logger.info(f"Daemon started. Will trade daily at {run_hour}:00 local time.")
     logger.info(f"Cities: {cities or tradeable_cities()}")
@@ -464,7 +528,7 @@ if __name__ == "__main__":
 Examples:
   python scheduler.py run                    # Run once now (live)
   python scheduler.py run --dry-run          # Run once (simulated)
-  python scheduler.py daemon                 # Run daily at 7am
+  python scheduler.py daemon                 # Run daily at config.RUN_HOUR
   python scheduler.py daemon --hour 6        # Run daily at 6am
   python scheduler.py --kill                 # STOP all trading
   python scheduler.py --resume               # Resume trading
@@ -499,8 +563,8 @@ Examples:
 
     # 'daemon' subcommand
     daemon_parser = subparsers.add_parser("daemon", help="Run continuously")
-    daemon_parser.add_argument("--hour", type=int, default=7,
-                               help="Hour to run each day (default: 7 = 7am)")
+    daemon_parser.add_argument("--hour", type=int, default=None,
+                               help=f"Hour to run each day (default: config.RUN_HOUR = {RUN_HOUR})")
     daemon_parser.add_argument("--cities", nargs="+", default=None,
                                choices=CITIES_ALL,
                                help="Cities to trade (default: every city "
@@ -526,53 +590,11 @@ Examples:
 
     # Handle subcommands
     if args.command == "run":
-        if args.dry_run:
-            # Dry run mirrors the LIVE sizing path (global pooled sizing by
-            # default), so paper numbers rehearse the code that trades.
-            dry_min_edge = (args.min_edge if args.min_edge is not None
-                            else default_min_edge())
-            dry_cities = args.cities or tradeable_cities()
-            try:
-                from config import SIZING_MODE as _mode
-            except ImportError:
-                _mode = "global"
-            if _mode == "per_city":
-                # Legacy even split (the revert path), as before.
-                from trader import run_trading_pipeline
-                try:
-                    from config import MAX_RUN_EXPOSURE_PCT as _pct
-                except ImportError:
-                    _pct = 0.25
-                dry_budget = (args.max_spend if args.max_spend is not None
-                              else 100.0 * _pct)
-                per_city = dry_budget / len(dry_cities)
-                total_spent = 0.0
-                for city in dry_cities:
-                    remaining = dry_budget - total_spent
-                    city_budget = min(per_city, remaining)
-                    if city_budget < 0.50:
-                        print(f"  Skipping {city}: only ${remaining:.2f} remaining")
-                        continue
-                    results = run_trading_pipeline(
-                        city_key=city,
-                        dry_run=True,
-                        max_spend=city_budget,
-                        min_edge=dry_min_edge,
-                        tomorrow_only=True,
-                    )
-                    total_spent += sum(r.order.cost_dollars for r in results if r.success)
-            else:
-                from trader import run_global_pipeline
-                run_global_pipeline(
-                    city_keys=dry_cities,
-                    dry_run=True,
-                    min_edge=dry_min_edge,
-                    tomorrow_only=True,
-                    max_spend=args.max_spend,
-                )
-        else:
-            run_once(cities=args.cities, max_spend=args.max_spend,
-                     min_edge=args.min_edge)
+        # Dry runs share the LIVE code path (settlement check if credentials
+        # exist, learning cycle, pooled sizing) with orders simulated, so
+        # paper numbers rehearse exactly the code that trades.
+        run_once(cities=args.cities, max_spend=args.max_spend,
+                 min_edge=args.min_edge, dry_run=args.dry_run)
 
     elif args.command == "daemon":
         run_daemon(run_hour=args.hour, cities=args.cities,

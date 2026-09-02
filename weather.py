@@ -9,10 +9,11 @@ distributions for daily high temperatures that are likely better-calibrated
 than what retail bettors use.
 """
 
-import requests
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Optional
+
+from http_util import get_with_retry
 
 
 # ── City configurations ─────────────────────────────────────────────
@@ -25,6 +26,10 @@ class City:
     lon: float
     timezone: str = "America/Chicago"
     nws_grid_url: Optional[str] = None  # cached after first lookup
+    # Forecast sources that must never feed this city's model or spread.
+    # Mirrored in training (the column is imputed from the other sources)
+    # so live and training see the same inputs.
+    excluded_sources: tuple = ()
 
 
 CITIES = {
@@ -78,6 +83,11 @@ CITIES = {
         lat=33.9425,
         lon=-118.4081,
         timezone="America/Los_Angeles",
+        # Open-Meteo's ECMWF (0.25° IFS) cell for LAX sits inland of the
+        # sea-breeze boundary and reads +6°F (annual) to +11°F (summer)
+        # warm vs the KLAX sensor. It poisoned the spread (11°F -> +2.8°F
+        # sigma inflation) and the LA model. Excluded everywhere.
+        excluded_sources=("ecmwf",),
     ),
     "philly": City(
         name="Philadelphia",
@@ -114,12 +124,11 @@ def get_grid_urls(city: City) -> dict:
     if key in _GRID_CACHE:
         return _GRID_CACHE[key]
 
-    resp = requests.get(
+    resp = get_with_retry(
         f"{NWS_BASE}/points/{city.lat},{city.lon}",
         headers=NWS_HEADERS,
         timeout=15,
     )
-    resp.raise_for_status()
     props = resp.json()["properties"]
 
     grid = {
@@ -140,8 +149,7 @@ def get_hourly_forecast(city: City) -> list[dict]:
     Returns list of {time, temperature, unit} dicts.
     """
     grid = get_grid_urls(city)
-    resp = requests.get(grid["forecast_hourly"], headers=NWS_HEADERS, timeout=15)
-    resp.raise_for_status()
+    resp = get_with_retry(grid["forecast_hourly"], headers=NWS_HEADERS, timeout=15)
 
     periods = resp.json()["properties"]["periods"]
     return [
@@ -162,8 +170,7 @@ def get_gridpoint_data(city: City) -> dict:
     This is more detailed than the public forecast.
     """
     grid = get_grid_urls(city)
-    resp = requests.get(grid["forecast_grid_data"], headers=NWS_HEADERS, timeout=15)
-    resp.raise_for_status()
+    resp = get_with_retry(grid["forecast_grid_data"], headers=NWS_HEADERS, timeout=15)
     return resp.json()["properties"]
 
 
@@ -206,20 +213,24 @@ def get_daily_high_forecast(city: City, target_date: str = None) -> dict:
     # returns forecast_high_f=None and callers skip the contract.
     forecast_high = max(target_temps) if target_temps else None
 
-    # Also try to get the official max temp from gridpoint data as a cross-check
+    # Gridpoint maxTemperature is only a FALLBACK for when the hourly
+    # forecast has no coverage for the date. It used to be fetched on every
+    # call (one extra NWS request per forecast, never used when hourly data
+    # existed), which added to the 429/5xx churn in the logs.
     official_high = None
-    try:
-        grid_data = get_gridpoint_data(city)
-        max_temps = grid_data.get("maxTemperature", {}).get("values", [])
-        for entry in max_temps:
-            # entries have 'validTime' like '2026-05-06T...' and 'value' in Celsius
-            valid_time = entry.get("validTime", "")
-            if target_date in valid_time:
-                celsius = entry["value"]
-                official_high = round(celsius * 9 / 5 + 32)  # convert to F
-                break
-    except Exception:
-        pass  # gridpoint data sometimes fails, hourly is our fallback
+    if forecast_high is None:
+        try:
+            grid_data = get_gridpoint_data(city)
+            max_temps = grid_data.get("maxTemperature", {}).get("values", [])
+            for entry in max_temps:
+                # entries have 'validTime' like '2026-05-06T...' and 'value' in Celsius
+                valid_time = entry.get("validTime", "")
+                if target_date in valid_time and entry.get("value") is not None:
+                    celsius = entry["value"]
+                    official_high = round(celsius * 9 / 5 + 32)  # convert to F
+                    break
+        except Exception:
+            pass  # gridpoint data sometimes fails
 
     # Use hourly max as primary source — it's more reliable.
     # The gridpoint maxTemperature sometimes returns stale or incorrect values.

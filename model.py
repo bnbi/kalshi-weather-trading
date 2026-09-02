@@ -11,10 +11,11 @@ The core idea:
 When the ensemble is unavailable, we fall back to NWS-only with default error estimates.
 """
 
+import math
 from dataclasses import dataclass
 from scipy import stats
 
-from weather_ensemble import build_ensemble
+from weather_ensemble import build_ensemble, record_decision
 from weather import (
     CITIES,
     get_daily_high_forecast,
@@ -65,7 +66,11 @@ def parse_contract_ticker(ticker: str) -> dict:
     months = {"JAN": "01", "FEB": "02", "MAR": "03", "APR": "04",
               "MAY": "05", "JUN": "06", "JUL": "07", "AUG": "08",
               "SEP": "09", "OCT": "10", "NOV": "11", "DEC": "12"}
-    month = months.get(month_str, "01")
+    month = months.get(month_str)
+    if month is None or not (date_str[:2].isdigit() and day.isdigit()):
+        # An unparseable date used to be silently mapped to January —
+        # which would price the contract off the wrong day's forecast.
+        return {"type": "unknown", "series": series, "ticker": ticker}
     date = f"{year}-{month}-{day}"
 
     if strike.startswith("T"):
@@ -93,8 +98,25 @@ def parse_contract_ticker(ticker: str) -> dict:
         return {"type": "unknown", "series": series, "date": date, "ticker": ticker}
 
 
+def threshold_is_below(title: str = "", strike_type: str = None) -> bool:
+    """
+    Direction of a T contract. The API's strike_type ('less' / 'greater')
+    is authoritative; the title ("<58°" / "below") is the fallback for
+    callers that only have a title.
+    """
+    if strike_type:
+        st = strike_type.lower()
+        if st in ("less", "less_or_equal", "below"):
+            return True
+        if st in ("greater", "greater_or_equal", "above"):
+            return False
+    title_lower = (title or "").lower()
+    return "<" in (title or "") or "below" in title_lower
+
+
 def compute_probability(forecast_high: float, error_std: float, bias: float,
-                        contract_info: dict, title: str = "") -> float:
+                        contract_info: dict, title: str = "",
+                        strike_type: str = None) -> float:
     """
     Compute the probability of a contract paying out YES.
 
@@ -111,6 +133,9 @@ def compute_probability(forecast_high: float, error_std: float, bias: float,
     - No weather forecast is ever 99%+ certain
     - The market has information we don't (local observers, newer data)
     - Overconfident probabilities create false "edge" that bleeds money
+    Note: with P(YES) capped at 0.97, P(NO) is at most 0.97 too, and with
+    find_edge's 25¢ credibility band a NO signal needs the NO ask >= 72¢ —
+    the effective floor, whatever MIN_NO_PRICE says.
     """
     PROB_FLOOR = 0.03
     PROB_CEILING = 0.97
@@ -127,15 +152,14 @@ def compute_probability(forecast_high: float, error_std: float, bias: float,
         #   "high > 65"   pays iff rounded high >= 66, i.e. temp >= 65.5
         #   "high > 87.5" pays iff rounded high >= 88, i.e. temp >= 87.5
         #   "high < 65"   pays iff rounded high <= 64, i.e. temp <  64.5
+        # (Verified against the stored market rules: "greater than 65°" /
+        # "less than 58°", per the NWS Climatological Report.)
         # Using cdf(threshold) directly overstated BOTH sides of integer
         # thresholds by up to ~10 points near the money (σ=2) — phantom edge.
-        import math
         above_cut = math.floor(threshold) + 0.5
         below_cut = math.ceil(threshold) - 0.5
 
-        # Determine direction from title
-        title_lower = title.lower()
-        if "<" in title or "below" in title_lower:
+        if threshold_is_below(title, strike_type):
             # P(rounded high < threshold)
             prob = dist.cdf(below_cut)
         else:
@@ -160,16 +184,22 @@ def compute_probability(forecast_high: float, error_std: float, bias: float,
 
 
 def predict_contract(ticker: str, title: str, city_key: str,
-                     ensemble_cache: dict = None) -> ContractPrediction:
+                     ensemble_cache: dict = None, strike_type: str = None,
+                     log_decisions: str = None) -> ContractPrediction:
     """
     Generate a probability prediction for a single contract.
 
     ticker: Kalshi market ticker (e.g. 'KXHIGHCHI-26MAY05-T65')
-    title: Market title (needed to determine above/below for threshold contracts)
+    title: Market title (fallback for above/below on threshold contracts)
     city_key: Key into CITIES dict ('chicago', 'nyc', 'miami')
     ensemble_cache: optional {date: EnsembleForecast} to avoid re-fetching
+    strike_type: the market's strike_type from the API ('greater'/'less')
+    log_decisions: when set (e.g. 'trade'), every freshly built ensemble is
+        written to decision_log — the record live recalibration re-scores.
     """
     contract_info = parse_contract_ticker(ticker)
+    if contract_info["type"] == "unknown":
+        raise ValueError(f"unparseable ticker {ticker}")
     city = CITIES[city_key]
     target_date = contract_info.get("date")
 
@@ -182,6 +212,8 @@ def predict_contract(ticker: str, title: str, city_key: str,
             ensemble = build_ensemble(city_key, target_date)
             if ensemble_cache is not None:
                 ensemble_cache[target_date] = ensemble
+            if log_decisions and ensemble.ensemble_high_f is not None:
+                record_decision(ensemble, city_key, purpose=log_decisions)
         except Exception as e:
             print(f"  Warning: ensemble failed, falling back to NWS-only: {e}")
 
@@ -218,23 +250,30 @@ def predict_contract(ticker: str, title: str, city_key: str,
 
             if obs is not None:
                 obs_max = obs["obs_max_f"]
-                candidates = [v for v in (forecast_high, rem_max, obs_max)
-                              if v is not None]
-                forecast_high = max(candidates)
                 bias = 0.0
                 if rem_max is not None and obs_max >= rem_max:
-                    # Peak already recorded — remaining hours can't beat it.
+                    # Peak already recorded — the day's high IS the observed
+                    # max, with σ covering the ±1°F by which the official
+                    # sensor reading can differ from the obs feed. The old
+                    # code kept the (higher) ensemble forecast here and
+                    # tightened σ around it — asserting the day would still
+                    # beat the recorded peak.
+                    forecast_high = obs_max
                     error_std = 1.0 if peak_confidence == "high" else 1.5
-                # else: peak still ahead of us — keep the ensemble σ; the
-                # remaining-hours forecast is NOT an observation.
-        except Exception:
-            pass
+                else:
+                    # Peak still ahead: the observed max is a floor on the
+                    # forecast, and the ensemble σ still applies — the
+                    # remaining-hours forecast is NOT an observation.
+                    forecast_high = max(forecast_high, obs_max)
+        except Exception as e:
+            print(f"  Warning: same-day observation fold failed for {ticker}: {e}")
 
-    prob = compute_probability(forecast_high, error_std, bias, contract_info, title)
+    prob = compute_probability(forecast_high, error_std, bias, contract_info,
+                               title, strike_type=strike_type)
 
     # Build description
     if contract_info["type"] == "threshold":
-        is_below = "<" in title or "below" in title.lower()
+        is_below = threshold_is_below(title, strike_type)
         desc = f"P(high {'<' if is_below else '>'} {contract_info['threshold']}°F)"
     elif contract_info["type"] == "bracket":
         desc = f"P({contract_info['bracket_low']}° ≤ high ≤ {contract_info['bracket_high']}°F)"
@@ -254,11 +293,14 @@ def predict_contract(ticker: str, title: str, city_key: str,
     )
 
 
-def predict_all_for_city(city_key: str, markets: list[dict]) -> list[ContractPrediction]:
+def predict_all_for_city(city_key: str, markets: list[dict],
+                         log_decisions: str = None) -> list[ContractPrediction]:
     """
     Generate predictions for all markets in a city's series.
 
     markets: list of market dicts from the Kalshi API
+    log_decisions: 'trade' from the trading pipeline (records each built
+        ensemble to decision_log); None for dashboards / CLI views.
     """
     predictions = []
     city = CITIES[city_key]
@@ -269,11 +311,13 @@ def predict_all_for_city(city_key: str, markets: list[dict]) -> list[ContractPre
         title = m.get("title", "")
 
         # Only process markets from this city's series
-        if not ticker.startswith(city.kalshi_series):
+        if not ticker.startswith(city.kalshi_series + "-"):
             continue
 
         try:
-            pred = predict_contract(ticker, title, city_key, ensemble_cache)
+            pred = predict_contract(ticker, title, city_key, ensemble_cache,
+                                    strike_type=m.get("strike_type"),
+                                    log_decisions=log_decisions)
             predictions.append(pred)
         except Exception as e:
             print(f"  Warning: could not predict {ticker}: {e}")

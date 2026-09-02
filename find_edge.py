@@ -15,7 +15,6 @@ This script ties everything together:
 
 from __future__ import annotations
 
-import requests
 from dataclasses import dataclass
 
 from weather import CITIES
@@ -38,29 +37,49 @@ class TradeSignal:
     description: str
 
 
+FEE_RATE = 0.07
+
+
 def kalshi_fee_per_contract(price: float) -> float:
     """
-    Kalshi trading fee per contract, in dollars.
+    Kalshi trading fee per contract, in dollars: 0.07 * price * (1 - price).
 
-    Fee formula: 0.07 * price * (1 - price), rounded up to the next cent.
-    Worst case is 1.75c at a 50c price; ~1.5c at 70c. Edges must clear
-    this to be profitable, so we subtract it before comparing to min_edge.
+    Kalshi charges the exact fractional amount per order (the trade log
+    shows fees like $0.0294 for 2 contracts @ 70¢ and $0.0138 for 1 @ 73¢),
+    so the old "round up to the next cent per contract" overstated fees by
+    ~35% at 70¢ (2¢ vs 1.47¢) in both the edge test and estimated P&L.
+    Worst case is 1.75¢ at a 50¢ price. Edges must clear this to be
+    profitable, so we subtract it before comparing to min_edge.
     """
-    import math
     if price <= 0 or price >= 1:
         return 0.0
-    return math.ceil(0.07 * price * (1 - price) * 100) / 100
+    return FEE_RATE * price * (1 - price)
 
 
 def get_market_prices(series_ticker: str) -> list[dict]:
     """Fetch current markets and prices for a series."""
-    resp = requests.get(f"{BASE_URL}/markets", params={
+    from http_util import get_with_retry
+    resp = get_with_retry(f"{BASE_URL}/markets", params={
         "limit": 200,
         "status": "open",
         "series_ticker": series_ticker,
     }, timeout=15)
-    resp.raise_for_status()
     return resp.json().get("markets", [])
+
+
+def market_price(m: dict, field: str) -> float | None:
+    """
+    A market price in DOLLARS. Prefers the fixed-point '<field>_dollars'
+    string; falls back to the legacy integer-cent field '<field>' (divided
+    by 100 — the old code used it raw, which would have read 43¢ as $43).
+    """
+    val = parse_price(m.get(f"{field}_dollars"))
+    if val is not None:
+        return val
+    legacy = parse_price(m.get(field))
+    if legacy is None:
+        return None
+    return legacy / 100.0 if legacy > 1.0 else legacy
 
 
 def calculate_edge(predictions: list[ContractPrediction],
@@ -81,12 +100,11 @@ def calculate_edge(predictions: list[ContractPrediction],
     for m in markets:
         ticker = m.get("ticker", "")
         market_lookup[ticker] = {
-            "yes_ask": parse_price(m.get("yes_ask_dollars", m.get("yes_ask"))),
-            "yes_bid": parse_price(m.get("yes_bid_dollars", m.get("yes_bid"))),
-            "no_ask": parse_price(m.get("no_ask_dollars", m.get("no_ask"))),
-            "last_price": parse_price(m.get("last_price_dollars", m.get("last_price"))),
+            "yes_ask": market_price(m, "yes_ask"),
+            "yes_bid": market_price(m, "yes_bid"),
+            "no_ask": market_price(m, "no_ask"),
+            "last_price": market_price(m, "last_price"),
             "title": m.get("title", ""),
-            "volume": m.get("volume_fp", m.get("volume", "0")),
         }
 
     # Maximum credible disagreement — if our model disagrees with the market
@@ -121,7 +139,10 @@ def calculate_edge(predictions: list[ContractPrediction],
     # 2. YES bets on brackets: NEVER — model can't pick specific 1°F ranges
     # 3. YES bets on thresholds: only when market price ≥ 13 cents
     #    (avoid cheap lottery tickets that almost never pay off)
-    MIN_NO_PRICE = 0.68     # only buy NO at 68c or above
+    MIN_NO_PRICE = 0.68     # only buy NO at 68c or above. (Effective floor
+                            # is 72c: P(yes) is clamped at 0.03, so P(no)
+                            # <= 0.97, and the 25c credibility band then
+                            # rejects any NO ask below 72c.)
     MIN_YES_PRICE = 0.13    # only buy YES at 13c or above
     ALLOW_BRACKET_YES = False  # bracket YES bets are -80% ROI — never take them
 
@@ -273,8 +294,8 @@ def print_full_comparison(predictions: list[ContractPrediction], markets: list[d
 
     for pred in sorted(predictions, key=lambda p: p.ticker):
         m = market_lookup.get(pred.ticker, {})
-        yes_ask = parse_price(m.get("yes_ask_dollars", m.get("yes_ask")))
-        no_ask = parse_price(m.get("no_ask_dollars", m.get("no_ask")))
+        yes_ask = market_price(m, "yes_ask")
+        no_ask = market_price(m, "no_ask")
 
         yes_edge = (pred.model_probability - yes_ask) if yes_ask is not None else None
         no_edge = ((1 - pred.model_probability) - no_ask) if no_ask is not None else None
