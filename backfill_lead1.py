@@ -23,6 +23,17 @@ Usage:
     python backfill_lead1.py            # backfill all cities, then retrain
     python backfill_lead1.py --city chicago
     python backfill_lead1.py --no-retrain
+
+REVERT SWITCH (mirrors config.py's SIZING_MODE pattern):
+    python backfill_lead1.py --revert   # restore lead-0 data + retrain
+
+--revert puts every preserved {src}_lead0_f value back into the forecast
+columns, recomputes errors/spread, and retrains — regenerating fresh
+models with the OLD (pre-lead-1) behavior, no network calls needed. This
+survives the nightly retrain (which a git-restored .pkl would not: the
+daily learner would overwrite it with a lead-1-trained model next
+morning). Re-applying lead-1 later is just running this script forward
+again (it refetches).
 """
 
 from __future__ import annotations
@@ -172,26 +183,90 @@ def backfill_city(conn: sqlite3.Connection, city_key: str) -> int:
     return updated
 
 
+def revert_city(conn: sqlite3.Connection, city_key: str) -> int:
+    """
+    Restore the preserved lead-0 values into the forecast columns and
+    recompute errors/spread — the data-level undo of backfill_city.
+    Offline (no API calls). The *_lead0_f columns are kept, so running
+    the forward backfill again later still preserves-once correctly.
+    """
+    rows = conn.execute("""
+        SELECT date, actual_high_f,
+               gfs_forecast_f, ecmwf_forecast_f, blend_forecast_f,
+               icon_forecast_f,
+               gfs_lead0_f, ecmwf_lead0_f, blend_lead0_f, icon_lead0_f
+        FROM historical_forecasts WHERE city = ? ORDER BY date
+    """, (city_key,)).fetchall()
+
+    reverted = 0
+    for (date_str, actual, gfs, ecmwf, blend, icon,
+         gfs0, ecmwf0, blend0, icon0) in rows:
+        current = {"gfs": gfs, "ecmwf": ecmwf, "blend": blend, "icon": icon}
+        saved0 = {"gfs": gfs0, "ecmwf": ecmwf0, "blend": blend0, "icon": icon0}
+
+        sets, params, final = [], [], {}
+        for src in SOURCES:
+            if saved0[src] is None:
+                final[src] = current[src]  # was never overwritten
+                continue
+            sets.append(f"{src}_forecast_f = ?")
+            params.append(saved0[src])
+            final[src] = saved0[src]
+            if actual is not None:
+                sets.append(f"{src}_error = ?")
+                params.append(saved0[src] - actual)
+
+        if not sets:
+            continue
+
+        core = [final[s] for s in ("gfs", "ecmwf", "blend")
+                if final[s] is not None]
+        if len(core) > 1:
+            sets.append("model_spread = ?")
+            params.append(max(core) - min(core))
+
+        params += [date_str, city_key]
+        conn.execute(f"""UPDATE historical_forecasts SET {', '.join(sets)}
+                         WHERE date = ? AND city = ?""", params)
+        reverted += 1
+
+    conn.commit()
+    print(f"  [{city_key}] restored lead-0 values on {reverted} rows")
+    return reverted
+
+
 def main():
     parser = argparse.ArgumentParser(description="Backfill lead-1 forecasts")
     parser.add_argument("--city", choices=list(CITIES.keys()), default=None)
     parser.add_argument("--no-retrain", action="store_true",
                         help="Skip retraining after the backfill")
+    parser.add_argument("--revert", action="store_true",
+                        help="Restore preserved lead-0 data and retrain "
+                             "(full undo of the lead-1 migration; offline)")
+    parser.add_argument("--db", default=DB_PATH,
+                        help="Database path (default: the live DB)")
     args = parser.parse_args()
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(args.db)
     ensure_lead0_columns(conn)
     cities = [args.city] if args.city else list(CITIES.keys())
 
     print("=" * 60)
-    print("STEP 1/2: Re-source forecasts at lead-1 (Previous Runs API)")
-    print("=" * 60)
-    for ck in cities:
-        backfill_city(conn, ck)
+    if args.revert:
+        print("STEP 1/2: REVERT — restore lead-0 forecasts from *_lead0_f")
+        print("=" * 60)
+        for ck in cities:
+            revert_city(conn, ck)
+    else:
+        print("STEP 1/2: Re-source forecasts at lead-1 (Previous Runs API)")
+        print("=" * 60)
+        for ck in cities:
+            backfill_city(conn, ck)
 
     if not args.no_retrain:
         print("\n" + "=" * 60)
-        print("STEP 2/2: Retrain models on lead-1 data")
+        print(f"STEP 2/2: Retrain models on "
+              f"{'restored lead-0' if args.revert else 'lead-1'} data")
         print("=" * 60)
         from train_model import train_and_evaluate
         for ck in cities:
@@ -201,7 +276,10 @@ def main():
                 print(f"  [{ck}] training failed: {e}")
 
     conn.close()
-    print("\nDone. Lead-0 originals preserved in *_lead0_f columns.")
+    if args.revert:
+        print("\nDone. Models now retrained on the ORIGINAL lead-0 data.")
+    else:
+        print("\nDone. Lead-0 originals preserved in *_lead0_f columns.")
 
 
 if __name__ == "__main__":

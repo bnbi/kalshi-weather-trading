@@ -880,3 +880,40 @@ def test_sniper_verify_ignores_era5_truth(tmp_path):
     assert sniper.verify_signals(conn) == 0
     assert conn.execute(
         "SELECT outcome FROM sniper_signals").fetchone()[0] is None
+
+
+def test_lead1_revert_restores_lead0_exactly(tmp_path):
+    """--revert must put every preserved lead-0 value back into the
+    forecast columns and recompute errors — the guaranteed undo path for
+    the lead-1 training migration."""
+    import backfill_lead1
+    conn = sqlite3.connect(tmp_path / "l1.db")
+    conn.execute("""
+        CREATE TABLE historical_forecasts (
+            date TEXT, city TEXT, actual_high_f REAL,
+            gfs_forecast_f REAL, ecmwf_forecast_f REAL, blend_forecast_f REAL,
+            icon_forecast_f REAL, gfs_error REAL, ecmwf_error REAL,
+            blend_error REAL, icon_error REAL, model_spread REAL,
+            PRIMARY KEY (date, city))
+    """)
+    backfill_lead1.ensure_lead0_columns(conn)
+    # row as it looks AFTER the lead-1 migration: forecast cols hold lead-1,
+    # originals preserved in *_lead0_f (icon never migrated -> lead0 NULL)
+    conn.execute("""INSERT INTO historical_forecasts
+        (date, city, actual_high_f,
+         gfs_forecast_f, ecmwf_forecast_f, blend_forecast_f, icon_forecast_f,
+         gfs_lead0_f, ecmwf_lead0_f, blend_lead0_f)
+        VALUES ('2026-06-01', 'chicago', 80.0,
+                83.0, 82.0, 84.0, 81.0,
+                80.5, 80.2, 80.9)""")
+    conn.commit()
+
+    assert backfill_lead1.revert_city(conn, "chicago") == 1
+    row = conn.execute("""SELECT gfs_forecast_f, ecmwf_forecast_f,
+        blend_forecast_f, icon_forecast_f, gfs_error, model_spread,
+        gfs_lead0_f FROM historical_forecasts""").fetchone()
+    assert row[0] == 80.5 and row[1] == 80.2 and row[2] == 80.9
+    assert row[3] == 81.0                       # icon untouched (no lead0)
+    assert row[4] == pytest.approx(0.5)         # error recomputed vs actual
+    assert row[5] == pytest.approx(80.9 - 80.2) # spread from restored values
+    assert row[6] == 80.5                       # lead0 kept for re-migration
