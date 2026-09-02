@@ -121,17 +121,26 @@ def compute_probability(forecast_high: float, error_std: float, bias: float,
     if contract_info["type"] == "threshold":
         threshold = contract_info["threshold"]
 
+        # Settlement is the INTEGER (rounded) daily high, so the continuous
+        # cutoffs must account for rounding — mirroring the bracket logic
+        # below and sniper.py's sample-rounding verifier.
+        #   "high > 65"   pays iff rounded high >= 66, i.e. temp >= 65.5
+        #   "high > 87.5" pays iff rounded high >= 88, i.e. temp >= 87.5
+        #   "high < 65"   pays iff rounded high <= 64, i.e. temp <  64.5
+        # Using cdf(threshold) directly overstated BOTH sides of integer
+        # thresholds by up to ~10 points near the money (σ=2) — phantom edge.
+        import math
+        above_cut = math.floor(threshold) + 0.5
+        below_cut = math.ceil(threshold) - 0.5
+
         # Determine direction from title
         title_lower = title.lower()
-        if ">" in title or "above" in title_lower:
-            # P(temp > threshold)
-            prob = 1 - dist.cdf(threshold)
-        elif "<" in title or "below" in title_lower:
-            # P(temp < threshold)
-            prob = dist.cdf(threshold)
+        if "<" in title or "below" in title_lower:
+            # P(rounded high < threshold)
+            prob = dist.cdf(below_cut)
         else:
-            # Default to "above" for T contracts
-            prob = 1 - dist.cdf(threshold)
+            # ">" / "above", and the default for T contracts
+            prob = 1 - dist.cdf(above_cut)
 
         return max(PROB_FLOOR, min(PROB_CEILING, prob))
 
@@ -188,25 +197,36 @@ def predict_contract(ticker: str, title: str, city_key: str,
         if forecast_high is None:
             raise ValueError(f"No forecast available for {city.name} on {target_date}")
 
-        lead_days = get_forecast_lead_days(target_date)
+        lead_days = get_forecast_lead_days(target_date, tz_name=city.timezone)
         error_std = get_forecast_error_std(lead_days)
         bias = NWS_FORECAST_BIAS.get(city_key, 0.0)
 
-    # For same-day contracts, also check if peak has passed
-    lead_days = get_forecast_lead_days(target_date)
+    # For same-day contracts, fold in ACTUAL station observations.
+    # NWS hourly forecasts only cover hours still ahead, so for today the
+    # "forecast high" is the max of the REMAINING hours — after the real
+    # peak passes, it underestimates the day's high. The already-observed
+    # station max is a hard floor, and only when it meets or exceeds
+    # everything still forecast has the peak actually been recorded.
+    lead_days = get_forecast_lead_days(target_date, tz_name=city.timezone)
     if lead_days <= 0:
         try:
+            from station_obs import get_observed_max
+            obs = get_observed_max(city_key, target_date)
             nws_forecast = get_daily_high_forecast(city, target_date)
+            rem_max = nws_forecast["forecast_high_f"]  # max of remaining hours
             peak_confidence = nws_forecast.get("peak_confidence", "low")
-            if peak_confidence == "high":
-                # Peak is done — use observed max with tight uncertainty
-                forecast_high = nws_forecast["forecast_high_f"]
-                error_std = 1.0
+
+            if obs is not None:
+                obs_max = obs["obs_max_f"]
+                candidates = [v for v in (forecast_high, rem_max, obs_max)
+                              if v is not None]
+                forecast_high = max(candidates)
                 bias = 0.0
-            elif peak_confidence == "medium":
-                forecast_high = nws_forecast["forecast_high_f"]
-                error_std = 1.5
-                bias = 0.0
+                if rem_max is not None and obs_max >= rem_max:
+                    # Peak already recorded — remaining hours can't beat it.
+                    error_std = 1.0 if peak_confidence == "high" else 1.5
+                # else: peak still ahead of us — keep the ensemble σ; the
+                # remaining-hours forecast is NOT an observation.
         except Exception:
             pass
 
@@ -214,7 +234,8 @@ def predict_contract(ticker: str, title: str, city_key: str,
 
     # Build description
     if contract_info["type"] == "threshold":
-        desc = f"P(high {'>' if '>' in title else '<'} {contract_info['threshold']}°F)"
+        is_below = "<" in title or "below" in title.lower()
+        desc = f"P(high {'<' if is_below else '>'} {contract_info['threshold']}°F)"
     elif contract_info["type"] == "bracket":
         desc = f"P({contract_info['bracket_low']}° ≤ high ≤ {contract_info['bracket_high']}°F)"
     else:

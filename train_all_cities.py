@@ -20,7 +20,8 @@ from weather import CITIES
 from historical_data import fetch_all_historical, print_data_summary, init_historical_tables
 from train_model import train_and_evaluate, get_model_path
 
-DB_PATH = "kalshi_data.db"
+from pathlib import Path
+DB_PATH = str(Path(__file__).parent / "kalshi_data.db")
 
 
 def check_data_available(conn: sqlite3.Connection, city: str) -> int:

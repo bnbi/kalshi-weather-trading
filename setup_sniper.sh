@@ -23,7 +23,13 @@ if launchctl list 2>/dev/null | grep -q "$LABEL"; then
     launchctl unload "$PLIST_DST" 2>/dev/null || true
 fi
 
-cp "$PLIST_SRC" "$PLIST_DST"
+# Rewrite the repo's placeholder paths to THIS checkout (a plain cp used
+# to install broken /Users/YOUR_USERNAME/... paths).
+sed "s|/Users/YOUR_USERNAME/kalshi-bot|$BOT_DIR|g" "$PLIST_SRC" > "$PLIST_DST"
+if grep -q "YOUR_USERNAME" "$PLIST_DST"; then
+    echo "ERROR: placeholder paths survived substitution — not loading."
+    exit 1
+fi
 launchctl load "$PLIST_DST"
 
 if launchctl list 2>/dev/null | grep -q "$LABEL"; then

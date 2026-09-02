@@ -33,13 +33,11 @@ from __future__ import annotations
 
 # Silence the cosmetic LibreSSL warning that urllib3 prints on macOS —
 # it fires once per run into stderr and looks like an error while meaning
-# nothing. Must run before the first `import requests`.
+# nothing. Filter by MESSAGE, before any urllib3 import: importing
+# urllib3.exceptions to get the class itself triggered the warning it was
+# meant to silence (the warning fires during urllib3's own import).
 import warnings as _warnings
-try:
-    from urllib3.exceptions import NotOpenSSLWarning as _NotOpenSSL
-    _warnings.filterwarnings("ignore", category=_NotOpenSSL)
-except Exception:
-    pass
+_warnings.filterwarnings("ignore", message=".*OpenSSL 1\\.1\\.1.*")
 
 
 import sqlite3
@@ -50,24 +48,24 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import numpy as np
-import requests
 
-from weather import CITIES, NWS_HEADERS, get_hourly_forecast
+from weather import CITIES, get_hourly_forecast
 from model import parse_contract_ticker
-from find_edge import get_market_prices, parse_price, TradeSignal
+from find_edge import (get_market_prices, parse_price, TradeSignal,
+                       kalshi_fee_per_contract)
 from trader import (size_orders, execute_orders, optimize_with_orderbook,
                     check_existing_positions)
 from pnl_tracker import log_trade_results
 from kalshi_client import create_client_from_config
+import station_obs
+from station_obs import get_observed_max
 
 BOT_DIR = Path(__file__).parent
 DB_PATH = BOT_DIR / "kalshi_data.db"
 KILL_SWITCH_FILE = BOT_DIR / "KILL_SWITCH"
 
-# Settlement stations (must match what Kalshi settles on)
-STATIONS = {"chicago": "KMDW", "nyc": "KNYC", "miami": "KMIA",
-            "denver": "KDEN", "austin": "KAUS", "la": "KLAX",
-            "philly": "KPHL"}
+# Settlement stations (single source of truth lives in station_obs.STATIONS)
+STATIONS = {k: v["nws"] for k, v in station_obs.STATIONS.items()}
 
 # ── Strategy parameters ─────────────────────────────────────────────
 MIN_LOCAL_HOUR = 13     # don't snipe before 1pm local — high not locked yet
@@ -137,47 +135,8 @@ def init_sniper_table(conn: sqlite3.Connection) -> None:
 
 
 # ── Real-time observations from the settlement station ─────────────
-
-def get_observed_max(city_key: str, local_date: str) -> dict | None:
-    """
-    Running max temperature today at the settlement station.
-    Returns {'obs_max_f', 'n_obs', 'last_obs'} or None if unavailable.
-    """
-    station = STATIONS[city_key]
-    tz = ZoneInfo(CITIES[city_key].timezone)
-    midnight_local = datetime.strptime(local_date, "%Y-%m-%d").replace(tzinfo=tz)
-    start = midnight_local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    try:
-        resp = requests.get(
-            f"https://api.weather.gov/stations/{station}/observations",
-            params={"start": start, "limit": 200},
-            headers=NWS_HEADERS, timeout=15)
-        resp.raise_for_status()
-        features = resp.json().get("features", [])
-    except Exception as e:
-        print(f"  [{city_key}] obs fetch failed: {e}")
-        return None
-
-    temps_f, last_obs = [], None
-    for f in features:
-        props = f.get("properties", {})
-        t = (props.get("temperature") or {}).get("value")
-        ts = props.get("timestamp")
-        if t is None or ts is None:
-            continue
-        # Only count observations whose LOCAL date matches the target date
-        obs_local = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(tz)
-        if obs_local.strftime("%Y-%m-%d") != local_date:
-            continue
-        temps_f.append(t * 9 / 5 + 32)
-        if last_obs is None or ts > last_obs:
-            last_obs = ts
-
-    if len(temps_f) < 3:
-        return None
-
-    return {"obs_max_f": max(temps_f), "n_obs": len(temps_f), "last_obs": last_obs}
+# get_observed_max moved to station_obs.py (imported above) so model.py's
+# same-day logic can use it too without a circular import.
 
 
 def get_remaining_forecast(city_key: str, local_date: str) -> dict:
@@ -236,11 +195,12 @@ def fit_final_high_model(conn: sqlite3.Connection) -> dict:
     σ floor keeps us from ever getting overconfident again; below FH_MIN_HISTORY
     days we fall back to a deliberately wide default.
     """
-    rows = conn.execute("""
+    rows = conn.execute(f"""
         SELECT AVG(s.rem_max_f), p.actual_high_f
         FROM sniper_signals s
         JOIN daily_predictions p ON p.date = s.date AND p.city = s.city
         WHERE s.rem_max_f IS NOT NULL AND p.actual_high_f IS NOT NULL
+        {_station_truth_filter(conn)}
         GROUP BY s.date, s.city
     """).fetchall()
     errs = [act - rem for rem, act in rows if rem is not None and act is not None]
@@ -378,7 +338,9 @@ def find_sniper_signals(city_key: str, local_date: str,
 
         # Cap claimed probability — v3's 97-99% claims won 36% of the time.
         p_no = min(V4_PROB_CAP, 1 - p_yes)
-        edge = p_no - no_ask
+        # Net of the exchange fee, like the day-ahead pipeline — a 10c gross
+        # edge at an 80c ask is really ~8.8c after the fee.
+        edge = p_no - no_ask - kalshi_fee_per_contract(no_ask)
         if p_no >= MIN_PROB and edge >= MIN_EDGE:
             signals.append(TradeSignal(
                 ticker=ticker, side="no", action="buy",
@@ -394,13 +356,32 @@ def find_sniper_signals(city_key: str, local_date: str,
 
 # ── Validation gate ─────────────────────────────────────────────────
 
+def _station_truth_filter(conn: sqlite3.Connection) -> str:
+    """
+    SQL clause restricting daily_predictions rows to settlement-station
+    truth. Rows verified from the ERA5 fallback can differ from the station
+    by 1-3°F — enough to flip a bracket outcome — and must never feed the
+    live-money validation gate or the final-high calibration. NULL is
+    accepted for legacy rows written before the source was recorded.
+    Returns '' when the column doesn't exist yet (un-migrated DB).
+    """
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(daily_predictions)")}
+    except sqlite3.Error:
+        return ""
+    if "actual_source" not in cols:
+        return ""
+    return " AND (p.actual_source IS NULL OR p.actual_source = 'station')"
+
+
 def verify_signals(conn: sqlite3.Connection) -> int:
     """Score past signals against actual highs from daily_predictions."""
-    rows = conn.execute("""
+    rows = conn.execute(f"""
         SELECT s.id, s.ticker, s.side, s.ask_price, p.actual_high_f
         FROM sniper_signals s
         JOIN daily_predictions p ON p.date = s.date AND p.city = s.city
         WHERE s.outcome IS NULL AND p.actual_high_f IS NOT NULL
+        {_station_truth_filter(conn)}
     """).fetchall()
 
     n = 0
@@ -414,7 +395,10 @@ def verify_signals(conn: sqlite3.Connection) -> int:
         else:
             continue
         won = yes_settled if side == "yes" else not yes_settled
-        profit = (1 - ask) if won else -ask
+        # Net of the exchange fee, so the validation gate's "positive
+        # hypothetical P&L" bar matches what live trading would earn.
+        fee = kalshi_fee_per_contract(ask)
+        profit = (1 - ask - fee) if won else (-ask - fee)
         conn.execute("UPDATE sniper_signals SET outcome = ?, hypo_profit = ? WHERE id = ?",
                      ("win" if won else "loss", profit, sid))
         n += 1
@@ -546,6 +530,17 @@ def run(cities: list[str] = None, mode: str = "dry", budget: float = DEFAULT_BUD
 
     # ── Live execution path ─────────────────────────────────────────
     client = create_client_from_config()
+
+    # True-up fills and cancel stale resting orders BEFORE committing new
+    # capital — resting maker orders fill adversely (the price only reaches
+    # them when the market has moved against the thesis).
+    try:
+        from pnl_tracker import init_pnl_tables, reconcile_fills
+        init_pnl_tables(conn)
+        reconcile_fills(conn, client)
+    except Exception as e:
+        print(f"  Warning: fill reconciliation failed: {e}")
+
     balance = client.get_balance().get("balance", 0) / 100
     # Percentage-based budget, same scheme as the day-ahead trader;
     # an explicit --budget still acts as a hard dollar ceiling.
@@ -572,12 +567,26 @@ def run(cities: list[str] = None, mode: str = "dry", budget: float = DEFAULT_BUD
         import config
         max_position = balance * getattr(config, "MAX_POSITION_PCT", 0.08)
         kelly = getattr(config, "KELLY_FRACTION", 0.25)
+        max_contracts = getattr(config, "MAX_CONTRACTS_PER_ORDER", 15)
+        max_open = getattr(config, "MAX_OPEN_POSITIONS", 6)
     except ImportError:
-        max_position, kelly = balance * 0.08, 0.25
+        max_position, kelly, max_contracts, max_open = balance * 0.08, 0.25, 15, 6
+
+    # MAX_OPEN_POSITIONS counts TOTAL simultaneous positions across both
+    # strategies, so open slots come off this run's allowance.
+    from trader import count_open_positions
+    n_open = count_open_positions(client)
+    if n_open:
+        max_open = max(0, max_open - n_open)
+        if max_open == 0:
+            print("  Position limit reached — no new positions.")
+            conn.close()
+            return
 
     orders = size_orders(signals_only, bankroll=balance, kelly_fraction=kelly,
                          max_position_dollars=max_position,
-                         max_total_dollars=budget)
+                         max_contracts=max_contracts,
+                         max_total_dollars=budget, max_positions=max_open)
     if not orders:
         print("  Nothing sized to trade.")
         conn.close()
@@ -593,9 +602,18 @@ def run(cities: list[str] = None, mode: str = "dry", budget: float = DEFAULT_BUD
     ok = [r for r in results if r.success]
     if ok:
         log_trade_results(ok)
-        conn.execute("""UPDATE sniper_signals SET traded = 1
-                        WHERE created_at = ? AND ticker IN ({})""".format(
-            ",".join("?" * len(ok))), (now_iso, *[r.order.ticker for r in ok]))
+        # Match on (date, ticker, side) — NOT created_at: a signal first
+        # logged by an earlier (possibly dry) run today keeps that run's
+        # created_at, and matching on it silently left live trades
+        # unmarked. The sniper trades same-day contracts, so the signal's
+        # date column equals the date embedded in the ticker. Upgrade mode
+        # to 'live' too so the record shows what actually happened.
+        for r in ok:
+            sig_date = parse_contract_ticker(r.order.ticker).get("date")
+            conn.execute("""UPDATE sniper_signals
+                            SET traded = 1, mode = 'live'
+                            WHERE date = ? AND ticker = ? AND side = ?""",
+                         (sig_date, r.order.ticker, r.order.side))
         conn.commit()
     for r in results:
         tag = "OK" if r.success else f"FAILED: {r.error}"

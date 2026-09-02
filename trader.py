@@ -24,7 +24,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 
 from kalshi_client import KalshiClient, create_client_from_config
-from find_edge import get_market_prices, calculate_edge, TradeSignal
+from find_edge import (get_market_prices, calculate_edge, TradeSignal,
+                       kalshi_fee_per_contract)
 from model import predict_all_for_city
 from weather import CITIES
 from pnl_tracker import log_trade_results
@@ -33,7 +34,11 @@ from orderbook import analyze_orderbook
 
 # ── Configuration defaults (overridden by config.py if present) ────
 
-DEFAULT_KELLY_FRACTION = 0.15       # 15% Kelly (was 25% — too aggressive)
+DEFAULT_KELLY_FRACTION = 0.15       # fallback ONLY when config.py is absent.
+                                    # With config.py present, KELLY_FRACTION
+                                    # there is what actually trades (0.25 as
+                                    # of 2026-09) — change it THERE, not here.
+                                    # An explicit --kelly beats both.
 DEFAULT_MAX_CONTRACTS = 15          # per-order cap; real limits are the 8%
                                     # position cap and orderbook depth cap
                                     # (was 5, which began binding at ~$60
@@ -74,7 +79,8 @@ class TradeResult:
 # ── Kelly criterion ────────────────────────────────────────────────
 
 def kelly_size(model_prob: float, market_price: float,
-               kelly_fraction: float = DEFAULT_KELLY_FRACTION) -> float:
+               kelly_fraction: float = DEFAULT_KELLY_FRACTION,
+               fee: float = 0.0) -> float:
     """
     Compute fractional Kelly bet size.
 
@@ -82,8 +88,12 @@ def kelly_size(model_prob: float, market_price: float,
         f* = (p * b - q) / b
     where:
         p = probability of winning
-        b = net odds (payout / cost - 1) = (1 - price) / price for a $1 contract
+        b = net odds = (payout - cost) / cost per contract
         q = 1 - p
+
+    fee: exchange fee per contract in dollars. It raises the cost basis and
+    lowers the win payout, so ignoring it oversizes every bet by a few
+    percent (and more near 50c where the fee peaks).
 
     We then multiply by kelly_fraction (e.g. 0.25) to be conservative.
     Returns fraction of bankroll to wager (0 to 1).
@@ -91,12 +101,14 @@ def kelly_size(model_prob: float, market_price: float,
     if market_price <= 0 or market_price >= 1:
         return 0.0
 
+    cost = market_price + fee
+    win = 1 - market_price - fee
+    if cost <= 0 or win <= 0:
+        return 0.0
+
     p = model_prob
     q = 1 - p
-    b = (1 - market_price) / market_price  # net odds
-
-    if b <= 0:
-        return 0.0
+    b = win / cost  # net odds
 
     full_kelly = (p * b - q) / b
     if full_kelly <= 0:
@@ -116,46 +128,57 @@ def size_orders(signals: list[TradeSignal], bankroll: float,
 
     Returns orders sorted by edge (best first), respecting all limits.
     """
-    orders = []
-    total_cost = 0.0
-
+    # ── Pass 1: what does Kelly want for each signal? ──────────────
+    # Collect unconstrained-by-budget demands first so that, when the run
+    # cap binds, we can scale ALL positions proportionally instead of
+    # greedily filling early ones and truncating the last. Proportional
+    # scaling preserves Kelly's relative allocation — including the balance
+    # of hedged same-city bracket pairs, which greedy truncation distorted.
+    candidates = []
     for signal in signals:
-        if len(orders) >= max_positions:
+        if len(candidates) >= max_positions:
             break
-
-        # Kelly sizing
-        kf = kelly_size(signal.model_prob, signal.market_price, kelly_fraction)
+        fee = kalshi_fee_per_contract(signal.market_price)
+        kf = kelly_size(signal.model_prob, signal.market_price,
+                        kelly_fraction, fee=fee)
         if kf <= 0:
             continue
-
-        # Dollar amount to risk
-        dollars_to_risk = bankroll * kf
-
-        # Apply position size cap
-        dollars_to_risk = min(dollars_to_risk, max_position_dollars)
-
-        # Apply total exposure cap
-        remaining_budget = max_total_dollars - total_cost
-        if remaining_budget <= 0:
-            break
-        dollars_to_risk = min(dollars_to_risk, remaining_budget)
-
-        # Convert to contracts
         price_cents = int(signal.market_price * 100)
         if price_cents <= 0 or price_cents >= 100:
             continue
+        want = min(bankroll * kf, max_position_dollars)
+        candidates.append((signal, kf, want, price_cents))
 
-        contracts = int(dollars_to_risk / signal.market_price)
+    total_want = sum(w for _, _, w, _ in candidates)
+    scale = 1.0
+    if total_want > max_total_dollars > 0:
+        scale = max_total_dollars / total_want
+
+    # ── Pass 2: allocate scaled amounts (budget guard for rounding) ─
+    orders = []
+    total_cost = 0.0
+
+    for signal, kf, want, price_cents in candidates:
+        remaining_budget = max_total_dollars - total_cost
+        if remaining_budget <= 0:
+            break
+        dollars_to_risk = min(want * scale, remaining_budget)
+
+        # Size on the all-in cost per contract (price + fee) so the wagered
+        # fraction of bankroll matches what Kelly computed.
+        per_contract = signal.market_price + kalshi_fee_per_contract(signal.market_price)
+        contracts = int(dollars_to_risk / per_contract)
         contracts = min(contracts, max_contracts)
 
         # Floor: with a small bankroll, fractional Kelly often suggests less
-        # than one contract's cost. If the signal cleared the edge threshold
-        # and one contract fits within the position cap and remaining budget,
-        # trade minimum size rather than sitting out entirely. Kelly sizing
-        # takes over naturally once the bankroll grows.
+        # than one contract's cost. Trade minimum size rather than sitting
+        # out — but only when Kelly wanted at least HALF a contract (round
+        # to nearest, capped at 2x the Kelly stake). An unconditional floor
+        # overbet the weakest admitted signals by 5-10x at small bankrolls.
         if contracts == 0:
             one_contract_cost = signal.market_price
-            if (one_contract_cost <= max_position_dollars
+            if (dollars_to_risk >= 0.5 * per_contract
+                    and one_contract_cost <= max_position_dollars
                     and one_contract_cost <= remaining_budget):
                 contracts = 1
 
@@ -224,12 +247,19 @@ def execute_orders(client: KalshiClient, orders: list[TradeOrder],
             order_id = order_data.get("order_id", "unknown")
 
             # V2 reports the actual fee for immediately-filled contracts.
-            # average_fee_paid is per contract; multiply by fill count.
+            # Field names vary across API generations — try the current
+            # *_dollars totals first, then the legacy per-contract average.
+            # None is fine: reconcile_fills trues fees up from GetOrder.
             fee = None
             try:
-                filled = float(order_data.get("fill_count") or 0)
+                filled = float(order_data.get("fill_count_fp")
+                               or order_data.get("fill_count") or 0)
+                total_fees = (float(order_data.get("taker_fees_dollars") or 0)
+                              + float(order_data.get("maker_fees_dollars") or 0))
                 avg_fee = float(order_data.get("average_fee_paid") or 0)
-                if filled > 0 and avg_fee > 0:
+                if total_fees > 0:
+                    fee = round(total_fees, 4)
+                elif filled > 0 and avg_fee > 0:
                     fee = round(avg_fee * filled, 4)
             except (TypeError, ValueError):
                 pass
@@ -291,8 +321,10 @@ def optimize_with_orderbook(client: KalshiClient, orders: list[TradeOrder],
             # Only use the optimal price if it's better (lower) than our current limit
             # and still maintains positive edge
             if new_price < old_price:
-                # Recalculate edge with better price
-                new_edge = order.signal.model_prob - (new_price / 100)
+                # Recalculate edge with better price — net of the exchange
+                # fee, same basis as the edge that admitted the signal.
+                new_edge = (order.signal.model_prob - (new_price / 100)
+                            - kalshi_fee_per_contract(new_price / 100))
                 if new_edge > 0.03:  # keep at least 3% edge
                     order.price_cents = new_price
                     order.cost_dollars = order.contracts * new_price / 100
@@ -306,7 +338,8 @@ def optimize_with_orderbook(client: KalshiClient, orders: list[TradeOrder],
 
             if new_price < old_price:
                 # signal.model_prob for NO signals is already P(NO)
-                new_edge = order.signal.model_prob - (new_price / 100)
+                new_edge = (order.signal.model_prob - (new_price / 100)
+                            - kalshi_fee_per_contract(new_price / 100))
                 if new_edge > 0.03:
                     order.price_cents = new_price
                     order.cost_dollars = order.contracts * new_price / 100
@@ -338,6 +371,22 @@ def optimize_with_orderbook(client: KalshiClient, orders: list[TradeOrder],
 
 # ── Pre-trade checks ───────────────────────────────────────────────
 
+def position_size(pos: dict) -> float:
+    """
+    Contracts held in a position row, handling API schema generations.
+    Current payloads use position_fp (signed fixed-point string: + = YES,
+    - = NO); older ones used position, or yes_count/no_count.
+    """
+    for key in ("position_fp", "position"):
+        val = pos.get(key)
+        if val is not None:
+            try:
+                return abs(float(val))
+            except (TypeError, ValueError):
+                pass
+    return (pos.get("yes_count") or 0) + (pos.get("no_count") or 0)
+
+
 def check_existing_positions(client: KalshiClient, tickers: list[str]) -> dict:
     """
     Check if we already have positions in any of these markets.
@@ -351,9 +400,9 @@ def check_existing_positions(client: KalshiClient, tickers: list[str]) -> dict:
         for pos in pos_list:
             t = pos.get("ticker", "")
             if t in tickers:
-                yes_count = pos.get("yes_count", 0) or 0
-                no_count = pos.get("no_count", 0) or 0
-                existing[t] = yes_count + no_count
+                count = position_size(pos)
+                if count > 0:
+                    existing[t] = count
 
         return existing
     except Exception as e:
@@ -361,12 +410,34 @@ def check_existing_positions(client: KalshiClient, tickers: list[str]) -> dict:
         return {}
 
 
-def filter_tomorrow_only(signals: list[TradeSignal]) -> list[TradeSignal]:
+def count_open_positions(client: KalshiClient) -> int | None:
+    """
+    Number of markets we currently hold ANY position in, or None if the
+    API call fails. Used to make MAX_OPEN_POSITIONS mean what it says:
+    a cap on total simultaneous positions, not just orders per run.
+    """
+    try:
+        positions = client.get_positions(limit=200)
+        return sum(1 for p in positions.get("market_positions", [])
+                   if position_size(p) > 0)
+    except Exception as e:
+        print(f"  Warning: could not count open positions: {e}")
+        return None
+
+
+def filter_tomorrow_only(signals: list[TradeSignal],
+                         tz_name: str = None) -> list[TradeSignal]:
     """
     Only keep signals for tomorrow's contracts.
     Today's contracts are too close to settlement — less edge, more risk.
+
+    tz_name: the city's IANA timezone. Without it, "tomorrow" is computed in
+    UTC, which after ~5-8pm US local time points at the local day-after-
+    tomorrow — dropping every genuine tomorrow signal in evening runs.
     """
-    tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%d")
+    from zoneinfo import ZoneInfo
+    now = datetime.now(ZoneInfo(tz_name)) if tz_name else datetime.now(timezone.utc)
+    tomorrow = (now + timedelta(days=1)).strftime("%Y-%m-%d")
 
     # Convert tomorrow to Kalshi date format (e.g. 2026-05-06 -> 26MAY06)
     dt = datetime.strptime(tomorrow, "%Y-%m-%d")
@@ -396,8 +467,9 @@ def print_trade_plan(orders: list[TradeOrder], bankroll: float, dry_run: bool) -
     print(f"  Orders: {len(orders)}")
     total_cost = sum(o.cost_dollars for o in orders)
     print(f"  Total cost: ${total_cost:.2f}")
-    print(f"  Weighted avg edge: {sum(o.edge * o.cost_dollars for o in orders) / total_cost:.1%}"
-          if total_cost > 0 else "")
+    if total_cost > 0:
+        avg_edge = sum(o.edge * o.cost_dollars for o in orders) / total_cost
+        print(f"  Weighted avg edge: {avg_edge:.1%}")
 
     print(f"\n  {'Ticker':<40} {'Side':<5} {'Qty':<5} {'Price':<7} {'Cost':<8} {'Edge':<7} {'Kelly'}")
     print(f"  {'-' * 85}")
@@ -427,7 +499,7 @@ def print_results(results: list[TradeResult], dry_run: bool) -> None:
     for r in successes:
         status = "OK" if not dry_run else "SIMULATED"
         print(f"    [{status}] {r.order.ticker} — {r.order.side.upper()} x{r.order.contracts} "
-              f"@ ${r.order.price_cents}¢ — ID: {r.order_id}")
+              f"@ {r.order.price_cents}¢ — ID: {r.order_id}")
 
     for r in failures:
         print(f"    [FAILED] {r.order.ticker} — {r.error}")
@@ -466,7 +538,7 @@ def _gather_signals(city_key: str, min_edge: float,
 
     if tomorrow_only and signals:
         pre_filter = list(signals)
-        signals = filter_tomorrow_only(signals)
+        signals = filter_tomorrow_only(signals, city.timezone)
         dropped = [s for s in pre_filter if s not in signals]
         if dropped:
             try:
@@ -552,6 +624,16 @@ def run_global_pipeline(city_keys: list, dry_run: bool = True,
             print(f"  Already have positions in: {list(existing.keys())}")
             all_signals = [s for s in all_signals
                            if s.ticker not in existing]
+        # MAX_OPEN_POSITIONS caps TOTAL simultaneous positions, so slots
+        # already occupied by open positions come off this run's budget.
+        n_open = count_open_positions(client)
+        if n_open:
+            max_positions = max(0, max_positions - n_open)
+            print(f"  Open positions: {n_open} — up to {max_positions} "
+                  f"new position(s) this run")
+            if max_positions == 0:
+                print("  Position limit reached — no new positions.")
+                return []
 
     orders = size_orders(
         all_signals, bankroll=bankroll, kelly_fraction=kelly_fraction,
@@ -585,7 +667,7 @@ def run_global_pipeline(city_keys: list, dry_run: bool = True,
 def run_trading_pipeline(city_key: str, dry_run: bool = True,
                          max_spend: float = None,
                          min_edge: float = DEFAULT_MIN_EDGE,
-                         kelly_fraction: float = DEFAULT_KELLY_FRACTION,
+                         kelly_fraction: float = None,
                          tomorrow_only: bool = True) -> list[TradeResult]:
     """
     Full trading pipeline: find edges → size → execute.
@@ -594,6 +676,10 @@ def run_trading_pipeline(city_key: str, dry_run: bool = True,
     2. Find edges above threshold
     3. Size positions with Kelly criterion
     4. Execute orders (or simulate in dry-run)
+
+    kelly_fraction: None (default) uses config.KELLY_FRACTION; an explicit
+    value (e.g. the CLI's --kelly) OVERRIDES config — previously config
+    silently won and the flag did nothing.
     """
     city = CITIES[city_key]
 
@@ -602,14 +688,19 @@ def run_trading_pipeline(city_key: str, dry_run: bool = True,
     # AFTER the bankroll is known (below), so they scale automatically.
     try:
         import config
-        kelly_fraction = getattr(config, "KELLY_FRACTION", kelly_fraction)
+        if kelly_fraction is None:
+            kelly_fraction = getattr(config, "KELLY_FRACTION", DEFAULT_KELLY_FRACTION)
         max_position_pct = getattr(config, "MAX_POSITION_PCT", 0.08)
         max_exposure_pct = getattr(config, "MAX_RUN_EXPOSURE_PCT", 0.25)
         max_positions = getattr(config, "MAX_OPEN_POSITIONS", DEFAULT_MAX_POSITIONS)
+        max_contracts = getattr(config, "MAX_CONTRACTS_PER_ORDER", DEFAULT_MAX_CONTRACTS)
     except ImportError:
+        if kelly_fraction is None:
+            kelly_fraction = DEFAULT_KELLY_FRACTION
         max_position_pct = 0.08
         max_exposure_pct = 0.25
         max_positions = DEFAULT_MAX_POSITIONS
+        max_contracts = DEFAULT_MAX_CONTRACTS
 
     # Step 1: Get markets and predictions
     print(f"Fetching {city.name} weather markets...")
@@ -643,7 +734,7 @@ def run_trading_pipeline(city_key: str, dry_run: bool = True,
     # Step 3: Filter to tomorrow only (today's are too close to settlement)
     if tomorrow_only:
         pre_filter = list(signals)
-        signals = filter_tomorrow_only(signals)
+        signals = filter_tomorrow_only(signals, city.timezone)
         dropped = [s for s in pre_filter if s not in signals]
         if dropped:
             # Same-day signals are a policy exclusion, not a math one —
@@ -694,6 +785,12 @@ def run_trading_pipeline(city_key: str, dry_run: bool = True,
         if existing:
             print(f"  Already have positions in: {list(existing.keys())}")
             signals = [s for s in signals if s.ticker not in existing]
+        n_open = count_open_positions(client)
+        if n_open:
+            max_positions = max(0, max_positions - n_open)
+            if max_positions == 0:
+                print("  Position limit reached — no new positions.")
+                return []
 
     # Step 5: Size positions
     orders = size_orders(
@@ -701,7 +798,7 @@ def run_trading_pipeline(city_key: str, dry_run: bool = True,
         bankroll=bankroll,
         kelly_fraction=kelly_fraction,
         max_position_dollars=max_position,
-        max_contracts=DEFAULT_MAX_CONTRACTS,
+        max_contracts=max_contracts,
         max_total_dollars=max_exposure,
         max_positions=max_positions,
     )
@@ -753,12 +850,10 @@ if __name__ == "__main__":
     parser.add_argument("--min-edge", type=float, default=DEFAULT_MIN_EDGE,
                         help=f"Minimum edge to trade (default: {DEFAULT_MIN_EDGE})")
     parser.add_argument("--kelly", type=float, default=None,
-                        help="Kelly fraction override (default: from config or 0.25)")
+                        help="Kelly fraction override (default: config.KELLY_FRACTION)")
     parser.add_argument("--include-today", action="store_true",
                         help="Also trade same-day contracts (risky)")
     args = parser.parse_args()
-
-    kelly = args.kelly if args.kelly else DEFAULT_KELLY_FRACTION
 
     if args.live:
         print("\n  *** LIVE TRADING MODE ***")
@@ -775,6 +870,6 @@ if __name__ == "__main__":
         dry_run=not args.live,
         max_spend=args.max_spend,
         min_edge=args.min_edge,
-        kelly_fraction=kelly,
+        kelly_fraction=args.kelly,
         tomorrow_only=not args.include_today,
     )

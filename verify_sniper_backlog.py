@@ -16,8 +16,10 @@ import time
 
 from sniper import parse_contract_ticker, validation_status, VALIDATION_MIN_SIGNALS
 from station_obs import fetch_station_daily_high
+from find_edge import kalshi_fee_per_contract
 
-DB_PATH = "kalshi_data.db"
+from pathlib import Path
+DB_PATH = str(Path(__file__).parent / "kalshi_data.db")
 
 
 def main():
@@ -57,7 +59,10 @@ def main():
             continue
 
         won = yes_settled if side == "yes" else not yes_settled
-        profit = (1 - ask) if won else -ask
+        # Net of the exchange fee, matching sniper.verify_signals — the
+        # validation gate must be graded on live economics.
+        fee = kalshi_fee_per_contract(ask)
+        profit = (1 - ask - fee) if won else (-ask - fee)
         conn.execute("""
             UPDATE sniper_signals SET outcome = ?, hypo_profit = ?
             WHERE id = ?

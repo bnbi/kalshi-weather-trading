@@ -15,7 +15,8 @@ from kalshi_client import KalshiClient
 
 # ── Database setup ──────────────────────────────────────────────────
 
-DB_PATH = "kalshi_data.db"
+from pathlib import Path
+DB_PATH = str(Path(__file__).parent / "kalshi_data.db")
 
 
 def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:

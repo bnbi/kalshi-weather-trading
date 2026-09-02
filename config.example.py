@@ -22,8 +22,8 @@ USE_DEMO = True
 KELLY_FRACTION = 0.25            # quarter-Kelly per trade
 MAX_POSITION_PCT = 0.08          # max 8% of bankroll on any one position
 MAX_RUN_EXPOSURE_PCT = 0.25     # max 25% of bankroll deployed per run
-MAX_OPEN_POSITIONS = 10          # max number of simultaneous positions
-MIN_EDGE_CENTS = 5               # only trade if edge > 5 cents
+MAX_OPEN_POSITIONS = 10          # max TOTAL simultaneous open positions
+MIN_EDGE_CENTS = 5               # live edge threshold (blended, net of fees)
 
 # ── Apple WeatherKit (optional 5th forecast source) ──────────────
 # From https://developer.apple.com/account:

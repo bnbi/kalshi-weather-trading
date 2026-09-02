@@ -54,9 +54,19 @@ fi
 # Create LaunchAgents directory if it doesn't exist
 mkdir -p "$HOME/Library/LaunchAgents"
 
-# Copy plist to LaunchAgents
-cp "$PLIST_SRC" "$PLIST_DST"
-echo "Installed plist to: $PLIST_DST"
+# Install plist with the repo's placeholder paths rewritten to THIS
+# checkout. A plain cp used to install /Users/YOUR_USERNAME/... paths,
+# which silently killed all scheduled trading.
+sed "s|/Users/YOUR_USERNAME/kalshi-bot|$BOT_DIR|g" "$PLIST_SRC" > "$PLIST_DST"
+if grep -q "YOUR_USERNAME" "$PLIST_DST"; then
+    echo "ERROR: placeholder paths survived substitution — not loading."
+    exit 1
+fi
+echo "Installed plist to: $PLIST_DST (paths -> $BOT_DIR)"
+if grep -q -- "--dry-run" "$PLIST_DST"; then
+    echo "NOTE: installed job runs in --dry-run (paper) mode. To trade live,"
+    echo "      remove the --dry-run line from $PLIST_DST and reload."
+fi
 
 # Load the job
 launchctl load "$PLIST_DST"
@@ -71,8 +81,8 @@ else
 fi
 
 echo ""
-echo "The bot will now run every day at 7:00 AM."
-echo "If your Mac is asleep at 7am, it will run as soon as you open the lid."
+echo "The bot will now run every day at 10:00 AM (see StartCalendarInterval)."
+echo "If your Mac is asleep then, it will run as soon as you open the lid."
 echo ""
 echo "Useful commands:"
 echo "  python scheduler.py --status                    # Check if trading is active"

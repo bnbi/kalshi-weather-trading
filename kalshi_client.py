@@ -107,8 +107,15 @@ class KalshiClient:
                     f"{response.status_code} {response.reason} for url: {url}",
                     response=response,
                 )
-                # 401/5xx before execution — safe to retry even mutations
-                continue
+                # 401 = signature rejected before execution — always safe
+                # to retry. 5xx is NOT safe for mutations: a 500 can arrive
+                # AFTER the exchange accepted the order, and re-sending
+                # risks a double fill (dedup on client_order_id is not a
+                # documented guarantee). A dropped order is recoverable on
+                # the next run; a doubled one is not.
+                if response.status_code == 401 or not is_mutation:
+                    continue
+                raise last_error
 
             response.raise_for_status()
             return response.json()

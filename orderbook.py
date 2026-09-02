@@ -38,7 +38,7 @@ class OrderbookAnalysis:
     yes_spread_cents: int = None  # ask - bid for YES side
     no_spread_cents: int = None
 
-    # Depth (total contracts within 5 cents of best price)
+    # Depth (total contracts across the best 5 price levels)
     yes_bid_depth: int = 0
     yes_ask_depth: int = 0
     no_bid_depth: int = 0

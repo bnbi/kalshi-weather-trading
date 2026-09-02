@@ -147,11 +147,11 @@ def api_daily_pnl():
 def api_positions():
     try:
         from kalshi_client import create_client_from_config
+        from trader import position_size
         client = create_client_from_config()
         resp = client.get_positions(limit=200)
         positions = resp.get("market_positions", [])
-        active = [p for p in positions
-                  if (p.get("yes_count", 0) or 0) + (p.get("no_count", 0) or 0) > 0]
+        active = [p for p in positions if position_size(p) > 0]
         return jsonify(active)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -185,9 +185,18 @@ def api_settle():
 
 # ── API: Predictions ─────────────────────────────────────────────
 
+_predictions_cache = {"ts": 0.0, "data": None}
+PREDICTIONS_CACHE_SECONDS = 300
+
+
 @app.route("/api/predictions")
 def api_predictions():
-    """Get model predictions vs market prices. Cached for 5 minutes."""
+    """Get model predictions vs market prices. Cached for 5 minutes —
+    an uncached call re-fetches every city's forecasts (~1 min)."""
+    import time as _time
+    if (_predictions_cache["data"] is not None
+            and _time.time() - _predictions_cache["ts"] < PREDICTIONS_CACHE_SECONDS):
+        return jsonify(_predictions_cache["data"])
     try:
         from find_edge import get_market_prices, parse_price
         from model import predict_all_for_city
@@ -224,6 +233,8 @@ def api_predictions():
             except Exception as e:
                 predictions_data.append({"city": city_key, "error": str(e)})
 
+        _predictions_cache["ts"] = _time.time()
+        _predictions_cache["data"] = predictions_data
         return jsonify(predictions_data)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -244,10 +255,11 @@ def api_status():
         lines = log_file.read_text().strip().split("\n")
         recent_logs = lines[-15:]
 
-    # Next scheduled run
+    # Next scheduled run (RUN_HOUR mirrors the launchd plist)
+    from scheduler import RUN_HOUR
     now = datetime.now()
-    next_run = now.replace(hour=7, minute=0, second=0, microsecond=0)
-    if now.hour >= 7:
+    next_run = now.replace(hour=RUN_HOUR, minute=0, second=0, microsecond=0)
+    if now.hour >= RUN_HOUR:
         next_run += timedelta(days=1)
 
     return jsonify({
@@ -278,25 +290,33 @@ def api_run():
     """Trigger a trading run in the background."""
     global _run_active
 
-    if _run_active:
-        return jsonify({"status": "error", "message": "A run is already in progress"}), 409
+    # Check-and-set under the lock — two rapid POSTs must not both pass
+    # the check and start concurrent runs.
+    with _run_lock:
+        if _run_active:
+            return jsonify({"status": "error",
+                            "message": "A run is already in progress"}), 409
+        _run_active = True
 
     data = request.json or {}
     dry_run = data.get("dry_run", True)
-    cities = data.get("cities", ["chicago", "nyc", "miami"])
+    cities = data.get("cities")  # None -> scheduler trades every city
+                                 # with a trained model (no stale list,
+                                 # no fossil --max-spend dollar cap)
 
-    cmd = [sys.executable, str(BOT_DIR / "scheduler.py"), "run",
-           "--cities"] + cities + ["--max-spend", "10"]
+    cmd = [sys.executable, str(BOT_DIR / "scheduler.py"), "run"]
+    if cities:
+        cmd += ["--cities"] + cities
     if dry_run:
         cmd.append("--dry-run")
 
     def run_in_background():
         global _run_active
-        _run_active = True
         try:
             subprocess.run(cmd, cwd=str(BOT_DIR))
         finally:
-            _run_active = False
+            with _run_lock:
+                _run_active = False
 
     thread = threading.Thread(target=run_in_background, daemon=True)
     thread.start()
@@ -423,11 +443,19 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Live trading dashboard")
     parser.add_argument("--port", type=int, default=5050, help="Port (default: 5050)")
+    parser.add_argument("--host", type=str, default="127.0.0.1",
+                        help="Bind address (default: 127.0.0.1 — localhost "
+                             "only). This app has NO authentication and its "
+                             "API can kill/resume/trigger LIVE trading runs; "
+                             "pass 0.0.0.0 only on a network you fully trust.")
     parser.add_argument("--debug", action="store_true", help="Debug mode")
     args = parser.parse_args()
 
     print(f"\n  Kalshi Weather Bot — Dashboard")
     print(f"  http://localhost:{args.port}")
+    if args.host not in ("127.0.0.1", "localhost", "::1"):
+        print(f"  WARNING: bound to {args.host} — anyone who can reach this "
+              f"machine can trigger live trades.")
     print(f"  Press Ctrl+C to stop\n")
 
-    app.run(host="0.0.0.0", port=args.port, debug=args.debug)
+    app.run(host=args.host, port=args.port, debug=args.debug)

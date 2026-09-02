@@ -93,17 +93,27 @@ CITIES = {
 # ── NWS API interaction ─────────────────────────────────────────────
 
 NWS_BASE = "https://api.weather.gov"
+# NWS asks for identifying contact info in the User-Agent and throttles
+# anonymous placeholders. The public repo is the contact point.
 NWS_HEADERS = {
-    "User-Agent": "(kalshi-weather-bot, contact@example.com)",
+    "User-Agent": "(kalshi-weather-bot, github.com/bnbi/kalshi-weather-trading)",
     "Accept": "application/geo+json",
 }
+
+# Grid lookups are static per coordinate — cache them so every forecast
+# call doesn't spend an extra round-trip on /points.
+_GRID_CACHE: dict = {}
 
 
 def get_grid_urls(city: City) -> dict:
     """
-    Look up the NWS grid point for a city.
+    Look up the NWS grid point for a city (cached per coordinates).
     Returns URLs for forecast endpoints.
     """
+    key = (city.lat, city.lon)
+    if key in _GRID_CACHE:
+        return _GRID_CACHE[key]
+
     resp = requests.get(
         f"{NWS_BASE}/points/{city.lat},{city.lon}",
         headers=NWS_HEADERS,
@@ -112,7 +122,7 @@ def get_grid_urls(city: City) -> dict:
     resp.raise_for_status()
     props = resp.json()["properties"]
 
-    return {
+    grid = {
         "forecast": props["forecast"],
         "forecast_hourly": props["forecastHourly"],
         "forecast_grid_data": props["forecastGridData"],
@@ -120,6 +130,8 @@ def get_grid_urls(city: City) -> dict:
         "grid_x": props["gridX"],
         "grid_y": props["gridY"],
     }
+    _GRID_CACHE[key] = grid
+    return grid
 
 
 def get_hourly_forecast(city: City) -> list[dict]:
@@ -188,16 +200,10 @@ def get_daily_high_forecast(city: City, target_date: str = None) -> dict:
         if hour_date == target_date:
             target_temps.append(h["temperature"])
 
-    if not target_temps:
-        # Try today if tomorrow has no data yet
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        for h in hourly:
-            hour_time = datetime.fromisoformat(h["time"])
-            hour_date = hour_time.strftime("%Y-%m-%d")
-            if hour_date == today:
-                target_temps.append(h["temperature"])
-        target_date = today
-
+    # NOTE: no fallback to another date. Substituting today's temps when the
+    # requested date has no hourly coverage (dates >~7 days out) silently
+    # priced far-out contracts off today's weather. A missing date now
+    # returns forecast_high_f=None and callers skip the contract.
     forecast_high = max(target_temps) if target_temps else None
 
     # Also try to get the official max temp from gridpoint data as a cross-check
@@ -217,8 +223,9 @@ def get_daily_high_forecast(city: City, target_date: str = None) -> dict:
 
     # Use hourly max as primary source — it's more reliable.
     # The gridpoint maxTemperature sometimes returns stale or incorrect values.
-    # Only use official_high if hourly data is unavailable.
-    best_forecast = forecast_high or official_high
+    # Only use official_high if hourly data is unavailable. (is-None check:
+    # a legitimate 0°F winter high is falsy and must not fall through.)
+    best_forecast = forecast_high if forecast_high is not None else official_high
 
     # Assess how confident we are that the observed max is the final high.
     # Key factors:
@@ -297,11 +304,18 @@ NWS_FORECAST_BIAS = {
 }
 
 
-def get_forecast_lead_days(target_date: str) -> int:
-    """Calculate how many days out the forecast is."""
+def get_forecast_lead_days(target_date: str, tz_name: str = None) -> int:
+    """
+    Calculate how many days out the forecast is.
+
+    tz_name: the city's IANA timezone. Pass it whenever the date refers to a
+    local market day — "today" in UTC rolls over at ~5-8pm US local time, so
+    the UTC default misclassifies evening runs (tomorrow looks like today).
+    """
+    from zoneinfo import ZoneInfo
     target = datetime.strptime(target_date, "%Y-%m-%d").date()
-    today = datetime.now(timezone.utc).date()
-    return (target - today).days
+    now = datetime.now(ZoneInfo(tz_name)) if tz_name else datetime.now(timezone.utc)
+    return (target - now.date()).days
 
 
 def get_forecast_error_std(lead_days: int) -> float:
@@ -319,7 +333,7 @@ def print_forecast_summary(city_key: str, target_date: str = None) -> None:
     city = CITIES[city_key]
     forecast = get_daily_high_forecast(city, target_date)
 
-    lead_days = get_forecast_lead_days(forecast["date"])
+    lead_days = get_forecast_lead_days(forecast["date"], tz_name=city.timezone)
     error_std = get_forecast_error_std(lead_days)
 
     print(f"\n{'=' * 50}")

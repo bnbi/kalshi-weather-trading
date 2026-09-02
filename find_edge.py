@@ -72,12 +72,17 @@ def calculate_edge(predictions: list[ContractPrediction],
     min_edge: minimum edge (in dollars) required to signal a trade.
               0.05 = 5 cents = 5% edge minimum.
     """
+    # Reset the counterfactual log up front so a mid-function exception can
+    # never leave a previous call's skips visible to the caller.
+    calculate_edge.last_skipped = []
+
     # Build a lookup of market prices by ticker
     market_lookup = {}
     for m in markets:
         ticker = m.get("ticker", "")
         market_lookup[ticker] = {
             "yes_ask": parse_price(m.get("yes_ask_dollars", m.get("yes_ask"))),
+            "yes_bid": parse_price(m.get("yes_bid_dollars", m.get("yes_bid"))),
             "no_ask": parse_price(m.get("no_ask_dollars", m.get("no_ask"))),
             "last_price": parse_price(m.get("last_price_dollars", m.get("last_price"))),
             "title": m.get("title", ""),
@@ -96,11 +101,13 @@ def calculate_edge(predictions: list[ContractPrediction],
 
     # Market-prior shrinkage: the market price is treated as a Bayesian
     # prior and our model only moves us partway off it.
-    #     blended_prob = MODEL_WEIGHT * model_prob + (1 - MODEL_WEIGHT) * price
+    #     blended_prob = MODEL_WEIGHT * model_prob + (1 - MODEL_WEIGHT) * prior
+    # where prior = the bid/ask MID when available (the ask alone overstates
+    # the bought side by ~half the spread), else the ask.
     # Live calibration showed the model claiming ~95% on bets that won 75%,
     # while the market price was nearly unbiased. Blending halves phantom
     # edge and shrinks Kelly stakes toward sanity. With MODEL_WEIGHT = 0.5,
-    # clearing a 7¢ min edge requires a raw model-market gap of 14¢.
+    # clearing a 7¢ min edge requires a raw model-market gap of ~14¢.
     MODEL_WEIGHT = 0.5
 
     # ── Trade selection rules (based on 75-trade P&L analysis) ─────
@@ -140,10 +147,19 @@ def calculate_edge(predictions: list[ContractPrediction],
         raw_yes = pred.model_probability - yes_ask
         raw_no = (1 - pred.model_probability) - no_ask
 
-        # Blend model with market prior. Since blended = w*model + (1-w)*price,
-        # the blended edge is simply w * (model - price).
-        yes_blend_prob = MODEL_WEIGHT * pred.model_probability + (1 - MODEL_WEIGHT) * yes_ask
-        no_blend_prob = MODEL_WEIGHT * (1 - pred.model_probability) + (1 - MODEL_WEIGHT) * no_ask
+        # Blend model with the market prior. The prior is the MID (when a
+        # bid exists), not the ask: blending with the ask of the side being
+        # bought inflates the blended win probability by ~half the spread on
+        # every trade — systematic Kelly over-sizing. With only an ask
+        # quoted, fall back to it (old behavior).
+        yes_bid = market["yes_bid"]
+        if yes_bid is not None and 0 < yes_bid <= yes_ask:
+            prior_yes = (yes_bid + yes_ask) / 2
+            prior_no = 1 - prior_yes
+        else:
+            prior_yes, prior_no = yes_ask, no_ask
+        yes_blend_prob = MODEL_WEIGHT * pred.model_probability + (1 - MODEL_WEIGHT) * prior_yes
+        no_blend_prob = MODEL_WEIGHT * (1 - pred.model_probability) + (1 - MODEL_WEIGHT) * prior_no
         # Edges are net of Kalshi's trading fee — a thin gross edge that
         # doesn't cover the fee is a losing trade, not a marginal one.
         yes_edge = yes_blend_prob - yes_ask - kalshi_fee_per_contract(yes_ask)
@@ -260,16 +276,17 @@ def print_full_comparison(predictions: list[ContractPrediction], markets: list[d
         yes_ask = parse_price(m.get("yes_ask_dollars", m.get("yes_ask")))
         no_ask = parse_price(m.get("no_ask_dollars", m.get("no_ask")))
 
-        yes_edge = (pred.model_probability - yes_ask) if yes_ask else None
-        no_edge = ((1 - pred.model_probability) - no_ask) if no_ask else None
+        yes_edge = (pred.model_probability - yes_ask) if yes_ask is not None else None
+        no_edge = ((1 - pred.model_probability) - no_ask) if no_ask is not None else None
 
-        yes_str = f"${yes_ask:.2f}" if yes_ask else "?"
-        no_str = f"${no_ask:.2f}" if no_ask else "?"
-        ye_str = f"{yes_edge:>+5.1%}" if yes_edge else "  ?"
-        ne_str = f"{no_edge:>+5.1%}" if no_edge else "  ?"
+        yes_str = f"${yes_ask:.2f}" if yes_ask is not None else "?"
+        no_str = f"${no_ask:.2f}" if no_ask is not None else "?"
+        ye_str = f"{yes_edge:>+5.1%}" if yes_edge is not None else "  ?"
+        ne_str = f"{no_edge:>+5.1%}" if no_edge is not None else "  ?"
 
         # Highlight positive edges
-        marker = " <--" if (yes_edge and yes_edge > 0.05) or (no_edge and no_edge > 0.05) else ""
+        marker = " <--" if ((yes_edge is not None and yes_edge > 0.05)
+                            or (no_edge is not None and no_edge > 0.05)) else ""
 
         print(f"  {pred.ticker:<40} {pred.model_probability:>5.1%}   {yes_str:<8} {no_str:<8} "
               f"{ye_str:<8} {ne_str}{marker}")

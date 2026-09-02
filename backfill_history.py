@@ -29,7 +29,8 @@ from historical_data import (
 )
 from station_obs import fetch_ghcnd_daily_highs
 
-DB_PATH = "kalshi_data.db"
+from pathlib import Path
+DB_PATH = str(Path(__file__).parent / "kalshi_data.db")
 BACKFILL_START = "2021-04-01"  # earliest reliable Open-Meteo forecast archive
 
 

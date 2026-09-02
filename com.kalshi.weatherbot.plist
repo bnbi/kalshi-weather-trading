@@ -17,8 +17,10 @@
         <string>/Users/YOUR_USERNAME/kalshi-bot/scheduler.py</string>
         <string>run</string>
         <string>--dry-run</string>
-        <string>--max-spend</string>
-        <string>10</string>
+        <!-- Sizing is percentage-of-bankroll (config.py: MAX_RUN_EXPOSURE_PCT).
+             Add "--max-spend N" back here only if you want a hard dollar
+             ceiling on top; fixed caps clip whichever order sizes last and
+             can unbalance hedged bracket pairs. -->
     </array>
 
     <!-- Working directory -->

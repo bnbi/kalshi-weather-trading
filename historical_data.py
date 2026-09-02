@@ -18,10 +18,11 @@ from datetime import datetime, timedelta
 from weather import CITIES, City
 
 OPEN_METEO_HEADERS = {
-    "User-Agent": "(kalshi-weather-bot, contact@example.com)",
+    "User-Agent": "(kalshi-weather-bot, github.com/bnbi/kalshi-weather-trading)",
 }
 
-DB_PATH = "kalshi_data.db"
+import os
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kalshi_data.db")
 
 
 def init_historical_tables(conn: sqlite3.Connection) -> None:

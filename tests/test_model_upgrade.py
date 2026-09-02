@@ -209,7 +209,9 @@ def _make_training_db(tmp_path, n_days=400):
 def test_training_produces_sigma_model_and_icon_feature(tmp_path, monkeypatch):
     import train_model
     conn = _make_training_db(tmp_path)
-    monkeypatch.chdir(tmp_path)  # pkl gets written here
+    # model paths are anchored to train_model.BOT_DIR — point it at tmp so
+    # the test never writes over the real trained models
+    monkeypatch.setattr(train_model, "BOT_DIR", str(tmp_path))
 
     model_data = train_model.train_and_evaluate("chicago", conn)
 
@@ -236,7 +238,7 @@ def test_sigma_varies_by_day(tmp_path, monkeypatch):
     must get a higher sigma than calm days."""
     import train_model
     conn = _make_training_db(tmp_path)
-    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(train_model, "BOT_DIR", str(tmp_path))
     model_data = train_model.train_and_evaluate("chicago", conn)
 
     if model_data["sigma_model"] is None:
@@ -409,16 +411,17 @@ def test_pct_sizing_full_pipeline_dry_run(monkeypatch):
     monkeypatch.setattr(trader, "get_market_prices", lambda s: [{"ticker": "x"}])
     monkeypatch.setattr(trader, "predict_all_for_city", lambda c, m: [object()])
     monkeypatch.setattr(trader, "calculate_edge", lambda p, m, min_edge: [sig])
-    monkeypatch.setattr(trader, "filter_tomorrow_only", lambda s: s)
+    monkeypatch.setattr(trader, "filter_tomorrow_only", lambda s, *a, **k: s)
 
     results = trader.run_trading_pipeline("chicago", dry_run=True)
 
     assert len(results) == 1
     order = results[0].order
-    # $100 dry-run bankroll, quarter-Kelly f=0.067 -> $6.68 -> 9 contracts
-    # (cap raised 5 -> 15, so Kelly is no longer clipped at this scale)
-    assert order.contracts == 9
-    assert order.cost_dollars == pytest.approx(6.30)
+    # $100 dry-run bankroll, fee-aware quarter-Kelly: fee(0.70)=2c makes the
+    # all-in cost 72c and net win 28c -> f=0.0536 -> $5.36/$0.72 -> 7
+    # contracts (was 9 when the fee was ignored — that WAS the oversizing)
+    assert order.contracts == 7
+    assert order.cost_dollars == pytest.approx(4.90)
     # position must respect the 8% ceiling of the dry-run bankroll
     assert order.cost_dollars <= 100.0 * 0.08
 
@@ -690,3 +693,190 @@ def test_global_pipeline_sizes_best_edge_first(monkeypatch):
     monkeypatch.setattr(trader, "_gather_signals", fake_gather)
     results = trader.run_global_pipeline(["chicago", "nyc"], dry_run=True)
     assert results[0].order.ticker.startswith("KXHIGHNY")  # best edge first
+
+
+# ── proportional scaling preserves hedge balance under the run cap ──
+
+def test_cap_scales_proportionally_not_greedily():
+    """When Kelly's total demand exceeds the run cap, all positions must
+    shrink by the same factor — a same-city hedge pair must stay balanced
+    instead of the last leg getting truncated (the old greedy behavior
+    that produced today's 6/6/2 lopsided book)."""
+    import trader
+    sigs = [find_edge.TradeSignal(
+        ticker=f"T{i}", side="no", action="buy", model_prob=0.82,
+        market_price=0.70, edge=0.10, expected_value=0.10, description="x")
+        for i in range(4)]  # identical signals -> identical Kelly demand
+    B = 100.0
+    orders = trader.size_orders(sigs, bankroll=B, kelly_fraction=0.25,
+        max_position_dollars=B*0.08, max_contracts=15,
+        max_total_dollars=B*0.25, max_positions=6)
+    assert len(orders) == 4
+    costs = [o.cost_dollars for o in orders]
+    # identical demands + binding cap -> near-identical allocations
+    # (within one contract of rounding), NOT a big-big-big-tiny tail
+    assert max(costs) - min(costs) <= 0.70 + 1e-9, costs
+    assert sum(costs) <= B*0.25 + 1e-9
+
+
+def test_no_scaling_when_cap_not_binding():
+    """Below the cap, sizing must equal plain fee-aware quarter-Kelly."""
+    import trader
+    sig = find_edge.TradeSignal(ticker="T", side="no", action="buy",
+        model_prob=0.78, market_price=0.70, edge=0.06,
+        expected_value=0.06, description="x")
+    orders = trader.size_orders([sig], bankroll=100.0, kelly_fraction=0.25,
+        max_position_dollars=8.0, max_contracts=15,
+        max_total_dollars=25.0, max_positions=6)
+    assert orders[0].contracts == 7  # fee-aware Kelly (9 when fee ignored)
+
+
+def test_kelly_fee_reduces_size():
+    """The exchange fee lowers net odds, so fee-aware Kelly must always be
+    smaller than the fee-blind stake (which oversized every bet)."""
+    import trader
+    no_fee = trader.kelly_size(0.80, 0.70, kelly_fraction=0.25)
+    with_fee = trader.kelly_size(0.80, 0.70, kelly_fraction=0.25, fee=0.02)
+    assert 0 < with_fee < no_fee
+
+
+# ── audit fixes: position parsing, stale orders, tz filter, priors ──
+
+def test_position_size_reads_current_api_schema():
+    """The live API stopped sending yes_count/no_count; position_fp is the
+    field now (signed fixed-point string). All generations must parse."""
+    import trader
+    assert trader.position_size({"position_fp": "6.00"}) == 6.0
+    assert trader.position_size({"position_fp": "-2.00"}) == 2.0   # NO side
+    assert trader.position_size({"position": -3}) == 3.0
+    assert trader.position_size({"yes_count": 2, "no_count": 1}) == 3
+    assert trader.position_size({"position_fp": "0.00"}) == 0.0
+    assert trader.position_size({}) == 0
+
+
+def test_check_existing_positions_with_position_fp():
+    import trader
+
+    class FakeClient:
+        def get_positions(self, limit=100):
+            return {"market_positions": [
+                {"ticker": "T-HELD", "position_fp": "-6.00"},
+                {"ticker": "T-FLAT", "position_fp": "0.00"},
+            ]}
+
+    existing = trader.check_existing_positions(FakeClient(), ["T-HELD", "T-FLAT"])
+    assert existing == {"T-HELD": 6.0}
+
+
+def test_filter_tomorrow_uses_city_local_date():
+    """After UTC rollover (~5-8pm US local), UTC-tomorrow is the local
+    day-after-tomorrow; the filter must use the city's local calendar."""
+    import trader
+    from zoneinfo import ZoneInfo
+    tz = "America/Chicago"
+    local_tomorrow = (datetime.now(ZoneInfo(tz)) + timedelta(days=1))
+    months = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+              "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
+    code = (f"{local_tomorrow.year % 100:02d}"
+            f"{months[local_tomorrow.month - 1]}{local_tomorrow.day:02d}")
+    sig = find_edge.TradeSignal(
+        ticker=f"KXHIGHCHI-{code}-B85.5", side="no", action="buy",
+        model_prob=0.85, market_price=0.72, edge=0.08,
+        expected_value=0.08, description="t")
+    assert trader.filter_tomorrow_only([sig], tz) == [sig]
+
+
+def test_stale_resting_order_is_canceled(tmp_path):
+    """An order still on the book after STALE_ORDER_HOURS must be canceled
+    (adverse selection guard); unfilled -> row deleted, partial -> recorded."""
+    import pnl_tracker as pt
+    conn = sqlite3.connect(tmp_path / "pnl.db")
+    pt.init_pnl_tables(conn)
+    pt.log_trade(conn, "T-OLD", "no", "buy", 4, 70, 2.80, order_id="ord-old")
+    pt.log_trade(conn, "T-NEW", "no", "buy", 4, 70, 2.80, order_id="ord-new")
+    # age the first order past the cutoff
+    old_ts = (datetime.utcnow()
+              - timedelta(hours=pt.STALE_ORDER_HOURS + 1)).isoformat() + "+00:00"
+    conn.execute("UPDATE trades SET timestamp=? WHERE ticker='T-OLD'", (old_ts,))
+    conn.commit()
+
+    resting = {"status": "resting", "fill_count_fp": "0.00",
+               "taker_fill_cost_dollars": "0", "maker_fill_cost_dollars": "0",
+               "taker_fees_dollars": "0", "maker_fees_dollars": "0"}
+
+    class FakeClient:
+        def __init__(self):
+            self.canceled = []
+        def get_order(self, oid):
+            return {"order": dict(resting)}
+        def cancel_order(self, oid):
+            self.canceled.append(oid)
+            return {}
+
+    client = FakeClient()
+    pt.reconcile_fills(conn, client=client)
+    # stale order canceled and its phantom row removed
+    assert client.canceled == ["ord-old"]
+    assert conn.execute(
+        "SELECT COUNT(*) FROM trades WHERE ticker='T-OLD'").fetchone()[0] == 0
+    # fresh resting order left alone (still excluded from scoring)
+    assert conn.execute(
+        "SELECT filled_contracts FROM trades WHERE ticker='T-NEW'").fetchone()[0] == 0
+
+
+def test_blend_prior_uses_mid_when_bid_available():
+    """With a bid quoted, the market prior is the mid — blending with the
+    ask inflated the bought side's win probability by ~half the spread."""
+    pred = _pred_for_skip("KXHIGHNY-26JUN10-T70", 0.05)  # P(no)=0.95
+    markets = [{"ticker": pred.ticker,
+                "yes_bid_dollars": "0.21", "yes_ask_dollars": "0.25",
+                "no_ask_dollars": "0.75", "title": "high > 70"}]
+    signals = find_edge.calculate_edge([pred], markets, min_edge=0.05)
+    no_sigs = [s for s in signals if s.side == "no"]
+    assert no_sigs
+    prior_no = 1 - (0.21 + 0.25) / 2                      # 0.77
+    expected_blend = 0.5 * 0.95 + 0.5 * prior_no          # 0.86
+    fee = find_edge.kalshi_fee_per_contract(0.75)
+    assert no_sigs[0].model_prob == pytest.approx(expected_blend, abs=1e-9)
+    assert no_sigs[0].edge == pytest.approx(expected_blend - 0.75 - fee, abs=1e-9)
+
+
+def test_sniper_verify_profit_is_net_of_fees(tmp_path):
+    """The validation gate's hypothetical P&L must include exchange fees —
+    a gross-P&L gate is easier to pass than live trading."""
+    import sniper
+    conn = sqlite3.connect(tmp_path / "s.db")
+    sniper.init_sniper_table(conn)
+    conn.execute("""CREATE TABLE daily_predictions
+                    (date TEXT, city TEXT, actual_high_f REAL,
+                     actual_source TEXT)""")
+    # bracket 88-89, settle 91 -> NO wins
+    conn.execute("""INSERT INTO sniper_signals
+        (created_at,date,city,ticker,side,prob,ask_price,mode)
+        VALUES('x','2026-07-01','nyc','KXHIGHNY-26JUL01-B88.5','no',0.9,0.80,'dry')""")
+    conn.execute("INSERT INTO daily_predictions VALUES('2026-07-01','nyc',91.0,'station')")
+    conn.commit()
+    assert sniper.verify_signals(conn) == 1
+    profit = conn.execute("SELECT hypo_profit FROM sniper_signals").fetchone()[0]
+    fee = find_edge.kalshi_fee_per_contract(0.80)
+    assert fee > 0
+    assert profit == pytest.approx(1 - 0.80 - fee, abs=1e-9)
+
+
+def test_sniper_verify_ignores_era5_truth(tmp_path):
+    """Rows verified from the ERA5 fallback must NOT feed the live-money
+    gate — reanalysis differs from the settlement station by 1-3°F."""
+    import sniper
+    conn = sqlite3.connect(tmp_path / "s.db")
+    sniper.init_sniper_table(conn)
+    conn.execute("""CREATE TABLE daily_predictions
+                    (date TEXT, city TEXT, actual_high_f REAL,
+                     actual_source TEXT)""")
+    conn.execute("""INSERT INTO sniper_signals
+        (created_at,date,city,ticker,side,prob,ask_price,mode)
+        VALUES('x','2026-07-01','nyc','KXHIGHNY-26JUL01-B88.5','no',0.9,0.80,'dry')""")
+    conn.execute("INSERT INTO daily_predictions VALUES('2026-07-01','nyc',91.0,'era5')")
+    conn.commit()
+    assert sniper.verify_signals(conn) == 0
+    assert conn.execute(
+        "SELECT outcome FROM sniper_signals").fetchone()[0] is None

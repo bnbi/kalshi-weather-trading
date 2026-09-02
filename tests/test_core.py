@@ -78,18 +78,33 @@ def _ncdf(x, mu, sd):
     return 0.5 * (1 + math.erf((x - mu) / (sd * math.sqrt(2))))
 
 
-def test_threshold_above_probability():
+def test_threshold_above_uses_rounding_cutoff():
+    # Settlement is the rounded integer high: "high > 70" pays iff the
+    # rounded high >= 71, i.e. continuous temp >= 70.5 — NOT temp > 70.
     info = {"type": "threshold", "threshold": 70.0}
     p = model.compute_probability(75.0, 3.0, 0.0, info, title="High temp > 70")
-    assert p == pytest.approx(1 - _ncdf(70.0, 75.0, 3.0), abs=1e-6)
+    assert p == pytest.approx(1 - _ncdf(70.5, 75.0, 3.0), abs=1e-6)
 
 
-def test_threshold_below_probability_is_complement():
+def test_threshold_half_degree_cutoff_unchanged():
+    # "high > 87.5" pays iff rounded high >= 88 <=> temp >= 87.5: the
+    # half-degree threshold IS the continuous cutoff.
+    info = {"type": "threshold", "threshold": 87.5}
+    p = model.compute_probability(86.0, 2.0, 0.0, info, title="high > 87.5")
+    assert p == pytest.approx(1 - _ncdf(87.5, 86.0, 2.0), abs=1e-6)
+
+
+def test_threshold_above_below_leave_room_for_exact_settle():
+    # ">70" (settle >= 71) and "<70" (settle <= 69) are NOT complements:
+    # a settle at exactly 70 loses both. above + below + P(settle == 70) = 1.
     above = model.compute_probability(
         75.0, 3.0, 0.0, {"type": "threshold", "threshold": 70.0}, "high > 70")
     below = model.compute_probability(
         75.0, 3.0, 0.0, {"type": "threshold", "threshold": 70.0}, "high < 70")
-    assert above + below == pytest.approx(1.0, abs=1e-6)
+    p_exact_70 = _ncdf(70.5, 75.0, 3.0) - _ncdf(69.5, 75.0, 3.0)
+    assert above == pytest.approx(1 - _ncdf(70.5, 75.0, 3.0), abs=1e-6)
+    assert below == pytest.approx(_ncdf(69.5, 75.0, 3.0), abs=1e-6)
+    assert above + below + p_exact_70 == pytest.approx(1.0, abs=1e-6)
 
 
 def test_bracket_uses_rounding_boundaries():

@@ -26,8 +26,14 @@ from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import mean_absolute_error
 
-DB_PATH = "kalshi_data.db"
-MODEL_PATH = "forecast_model_chicago.pkl"
+import os
+
+# Anchor to the module's directory — CWD-relative paths trained against a
+# fresh empty DB (or saved models where the loaders never look) whenever a
+# script ran from anywhere but the bot directory.
+BOT_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BOT_DIR, "kalshi_data.db")
+MODEL_PATH = os.path.join(BOT_DIR, "forecast_model_chicago.pkl")
 
 # Apple WeatherKit becomes a trained feature only once it covers enough of
 # the training set. Expect roughly 6 months of live collection to clear this.
@@ -45,8 +51,8 @@ def _wk_mode() -> str:
 
 
 def get_model_path(city: str) -> str:
-    """Get the model file path for a specific city."""
-    return f"forecast_model_{city}.pkl"
+    """Absolute path of the model file for a specific city."""
+    return os.path.join(BOT_DIR, f"forecast_model_{city}.pkl")
 
 
 def load_training_data(conn: sqlite3.Connection, city: str) -> pd.DataFrame:
@@ -499,14 +505,20 @@ def predict_with_trained_model(gfs: float, ecmwf: float, blend: float,
         "constant_std": model_data["residual_std"],
         "model_name": model_data["model_name"],
         "train_mae": model_data["train_mae"],
+        # True when Apple's forecast is already a trained input — the
+        # ensemble's post-hoc WeatherKit shrinkage must then be skipped
+        # or Apple would be counted twice.
+        "used_weatherkit_feature": "wk" in feature_names,
     }
 
 
 if __name__ == "__main__":
     import argparse
 
+    from weather import CITIES
+
     parser = argparse.ArgumentParser(description="Train forecast error model")
-    parser.add_argument("city", choices=["chicago", "nyc", "miami"], help="City to train on")
+    parser.add_argument("city", choices=list(CITIES.keys()), help="City to train on")
     parser.add_argument("--db", type=str, default=DB_PATH, help="Database path")
     parser.add_argument("--predict", nargs=3, type=float, metavar=("GFS", "ECMWF", "BLEND"),
                         help="Make a prediction given three forecasts")

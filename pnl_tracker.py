@@ -132,6 +132,28 @@ def log_trade(conn: sqlite3.Connection, ticker: str, side: str, action: str,
 
 # ── Fill reconciliation ────────────────────────────────────────────
 
+# Orders still resting on the book after this many hours are canceled.
+# A resting maker order is adversely selected: the price only reaches it
+# when the market has moved AGAINST the model since the order was placed,
+# so the stale limit fills exactly when the thesis has gone bad. The saved
+# spread is captured on quick fills; anything older is pulled.
+STALE_ORDER_HOURS = 4
+
+# Order states that mean the order is off the book (nothing to cancel).
+TERMINAL_ORDER_STATUSES = {"canceled", "cancelled", "executed", "expired"}
+
+
+def _order_age_hours(timestamp: str) -> float:
+    """Hours since a trade row's ISO timestamp (UTC). inf if unparseable."""
+    try:
+        placed = datetime.fromisoformat(timestamp)
+        if placed.tzinfo is None:
+            placed = placed.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - placed).total_seconds() / 3600
+    except (TypeError, ValueError):
+        return float("inf")
+
+
 def reconcile_fills(conn: sqlite3.Connection, client=None) -> int:
     """
     True-up unsettled trades against Kalshi's actual order state.
@@ -141,14 +163,16 @@ def reconcile_fills(conn: sqlite3.Connection, client=None) -> int:
     optimistic assume-full-fill records with reality:
       - 0 filled + canceled  -> trade row deleted (it never happened)
       - 0 filled + resting   -> marked filled_contracts=0 (excluded from
-                                settlement scoring until it fills or dies)
+                                settlement scoring until it fills or dies);
+                                canceled outright once STALE_ORDER_HOURS old
       - partial/full fill    -> contracts, cost, and fees set to the actual
                                 values from the exchange (incl. maker/taker
-                                fee split, replacing estimates)
+                                fee split, replacing estimates); any stale
+                                unfilled remainder is canceled
     Returns number of trades adjusted.
     """
     rows = conn.execute("""
-        SELECT id, order_id, contracts, cost_dollars FROM trades
+        SELECT id, order_id, contracts, cost_dollars, timestamp FROM trades
         WHERE settled = 0 AND order_id IS NOT NULL
           AND order_id NOT LIKE 'DRY-%'
     """).fetchall()
@@ -160,7 +184,7 @@ def reconcile_fills(conn: sqlite3.Connection, client=None) -> int:
         client = create_client_from_config()
 
     adjusted = 0
-    for tid, order_id, logged_contracts, logged_cost in rows:
+    for tid, order_id, logged_contracts, logged_cost, placed_at in rows:
         try:
             o = client.get_order(order_id).get("order", {})
         except Exception as e:
@@ -169,7 +193,7 @@ def reconcile_fills(conn: sqlite3.Connection, client=None) -> int:
         if not o:
             continue
         try:
-            filled = float(o.get("fill_count_fp") or 0)
+            filled = float(o.get("fill_count_fp") or o.get("fill_count") or 0)
             status = o.get("status", "")
             cost = (float(o.get("taker_fill_cost_dollars") or 0)
                     + float(o.get("maker_fill_cost_dollars") or 0))
@@ -178,10 +202,39 @@ def reconcile_fills(conn: sqlite3.Connection, client=None) -> int:
         except (TypeError, ValueError):
             continue
 
-        if filled == 0:
-            if status == "canceled":
+        # Stale-order guard: pull anything still on the book after the
+        # cutoff, then re-read its final state so the fills recorded below
+        # are the true ones (a fill can race the cancel).
+        still_open = status not in TERMINAL_ORDER_STATUSES
+        if still_open and _order_age_hours(placed_at) >= STALE_ORDER_HOURS:
+            try:
+                client.cancel_order(order_id)
+                print(f"    [STALE] canceled resting order {order_id} "
+                      f"(> {STALE_ORDER_HOURS}h on the book)")
+            except Exception as e:
+                print(f"    stale-cancel failed for {order_id}: {e}")
+            try:
+                o2 = client.get_order(order_id).get("order", {})
+                filled = float(o2.get("fill_count_fp")
+                               or o2.get("fill_count") or filled)
+                status = o2.get("status", status)
+                cost = (float(o2.get("taker_fill_cost_dollars") or 0)
+                        + float(o2.get("maker_fill_cost_dollars") or 0)) or cost
+                fees = (float(o2.get("taker_fees_dollars") or 0)
+                        + float(o2.get("maker_fees_dollars") or 0)) or fees
+            except Exception:
+                pass
+            if filled == 0:
+                # Nothing ever filled — remove the phantom row now rather
+                # than waiting for the next pass to see the canceled state.
                 conn.execute("DELETE FROM trades WHERE id = ?", (tid,))
-                print(f"    [UNFILLED] order {order_id} canceled with no "
+                adjusted += 1
+                continue
+
+        if filled == 0:
+            if status in TERMINAL_ORDER_STATUSES:
+                conn.execute("DELETE FROM trades WHERE id = ?", (tid,))
+                print(f"    [UNFILLED] order {order_id} {status} with no "
                       f"fill — phantom trade removed")
                 adjusted += 1
             else:  # still resting — exclude from scoring for now
@@ -212,10 +265,22 @@ def check_settlements(conn: sqlite3.Connection) -> int:
     """
     Check Kalshi API for settled markets and update trade records.
     Returns number of newly settled trades.
+
+    Always reconciles fills FIRST: scoring an assumed-full-fill record is
+    permanent (settled=1 excludes it from reconciliation forever), so a
+    partially-filled resting order settled before reconciliation would lock
+    wrong contracts/cost/P&L into the books.
     """
     from kalshi_client import create_client_from_config
 
-    # Get unsettled trades
+    client = create_client_from_config()
+
+    try:
+        reconcile_fills(conn, client)
+    except Exception as e:
+        print(f"  Warning: fill reconciliation failed: {e}")
+
+    # Get unsettled trades (after reconciliation may have pruned/fixed rows)
     unsettled = conn.execute("""
         SELECT id, ticker, side, contracts, price_cents, cost_dollars,
                fee_dollars
@@ -230,7 +295,6 @@ def check_settlements(conn: sqlite3.Connection) -> int:
 
     print(f"  Checking {len(unsettled)} unsettled trade(s)...")
 
-    client = create_client_from_config()
     settled_count = 0
 
     # Group by ticker to minimize API calls
@@ -701,6 +765,16 @@ def verify_skipped_signals(conn: sqlite3.Connection) -> int:
     """Score unverified skipped signals against Kalshi's settled results."""
     from kalshi_client import create_client_from_config
 
+    # Markets older than ~2 weeks get archived by Kalshi and can no longer
+    # be fetched via get_market — mark those rows void instead of retrying
+    # them on every run forever.
+    conn.execute("""
+        UPDATE skipped_signals SET outcome = 'void'
+        WHERE outcome IS NULL
+          AND created_at < datetime('now', '-14 days')
+    """)
+    conn.commit()
+
     rows = conn.execute("""
         SELECT id, ticker, side, ask_price FROM skipped_signals
         WHERE outcome IS NULL
@@ -741,11 +815,11 @@ def print_skipped_report(conn: sqlite3.Connection) -> None:
     print(f"{'=' * 62}")
     rows = conn.execute("""
         SELECT reason, COUNT(*),
-               SUM(outcome IS NOT NULL),
+               SUM(outcome IN ('win','loss')),
                SUM(CASE WHEN outcome = 'win' THEN 1 ELSE 0 END),
-               AVG(CASE WHEN outcome IS NOT NULL THEN model_prob END),
+               AVG(CASE WHEN outcome IN ('win','loss') THEN model_prob END),
                SUM(hypo_profit),
-               SUM(CASE WHEN outcome IS NOT NULL THEN ask_price ELSE 0 END)
+               SUM(CASE WHEN outcome IN ('win','loss') THEN ask_price ELSE 0 END)
         FROM skipped_signals GROUP BY reason ORDER BY 2 DESC
     """).fetchall()
     if not rows:

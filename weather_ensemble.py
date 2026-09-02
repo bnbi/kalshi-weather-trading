@@ -41,7 +41,7 @@ def _wk_config(name: str, default):
 
 
 OPEN_METEO_HEADERS = {
-    "User-Agent": "(kalshi-weather-bot, contact@example.com)",
+    "User-Agent": "(kalshi-weather-bot, github.com/bnbi/kalshi-weather-trading)",
 }
 
 
@@ -147,8 +147,11 @@ class EnsembleForecast:
             # Nudge the ML point forecast toward Apple's, by a weight
             # learned from how much Apple's disagreement has historically
             # predicted the model's own error. No-ops until there is
-            # enough verified history.
-            self._apply_weatherkit_blend()
+            # enough verified history — and is SKIPPED once the trained
+            # model consumes Apple as a feature, so Apple never counts
+            # twice in the same prediction.
+            if not ml_result.get("used_weatherkit_feature"):
+                self._apply_weatherkit_blend()
 
             spread_inflation = self.model_spread / 4.0  # more disagreement → more uncertainty
             self.ensemble_std = base_std + spread_inflation

@@ -23,13 +23,11 @@ from __future__ import annotations
 
 # Silence the cosmetic LibreSSL warning that urllib3 prints on macOS —
 # it fires once per run into stderr and looks like an error while meaning
-# nothing. Must run before the first `import requests`.
+# nothing. Filter by MESSAGE, before any urllib3 import: importing
+# urllib3.exceptions to get the class itself triggered the warning it was
+# meant to silence (the warning fires during urllib3's own import).
 import warnings as _warnings
-try:
-    from urllib3.exceptions import NotOpenSSLWarning as _NotOpenSSL
-    _warnings.filterwarnings("ignore", category=_NotOpenSSL)
-except Exception:
-    pass
+_warnings.filterwarnings("ignore", message=".*OpenSSL 1\\.1\\.1.*")
 
 
 import os
@@ -45,6 +43,13 @@ BOT_DIR = Path(__file__).parent
 KILL_SWITCH_FILE = BOT_DIR / "KILL_SWITCH"
 LOG_DIR = BOT_DIR / "logs"
 LOG_DIR.mkdir(exist_ok=True)
+
+# Hour of the daily launchd run (com.kalshi.weatherbot.plist). Keep in sync
+# with the plist — status displays derive "next run" from this.
+RUN_HOUR = 10
+
+# Per-day trader logs older than this are pruned on each run.
+LOG_RETENTION_DAYS = 60
 
 # All configured cities (import kept lazy-safe: weather has no side effects)
 from weather import CITIES as _CITIES
@@ -64,6 +69,9 @@ def setup_logging() -> logging.Logger:
     today = datetime.now().strftime("%Y-%m-%d")
     log_file = LOG_DIR / f"trader_{today}.log"
 
+    # force=True replaces any handlers from a previous day's setup, so a
+    # long-lived daemon rolls to the new day's file instead of writing to
+    # the file named for the day it started.
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
@@ -72,8 +80,24 @@ def setup_logging() -> logging.Logger:
             logging.FileHandler(log_file, mode="a"),
             logging.StreamHandler(sys.stdout),
         ],
+        force=True,
     )
     return logging.getLogger("scheduler")
+
+
+def prune_old_logs(days: int = LOG_RETENTION_DAYS) -> int:
+    """Delete per-day trader logs older than `days`. Returns count removed."""
+    import time as _time
+    cutoff = _time.time() - days * 86400
+    removed = 0
+    try:
+        for f in LOG_DIR.glob("trader_*.log"):
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+                removed += 1
+    except OSError:
+        pass
+    return removed
 
 
 # ── Kill switch ────────────────────────────────────────────────────
@@ -134,9 +158,8 @@ def print_status() -> None:
 
     # Show upcoming schedule
     now = datetime.now()
-    run_hour = 7
-    next_run = now.replace(hour=run_hour, minute=0, second=0, microsecond=0)
-    if now.hour >= run_hour:
+    next_run = now.replace(hour=RUN_HOUR, minute=0, second=0, microsecond=0)
+    if now.hour >= RUN_HOUR:
         next_run += timedelta(days=1)
     print(f"\n  Next scheduled run: {next_run.strftime('%Y-%m-%d %H:%M')} local time")
     print()
@@ -144,13 +167,33 @@ def print_status() -> None:
 
 # ── Trading run ────────────────────────────────────────────────────
 
+def default_min_edge() -> float:
+    """
+    The live edge threshold: config.MIN_EDGE_CENTS (in cents) when set,
+    else 5 cents. Previously the config knob was documentation-only and the
+    hardcoded 5c always won, whatever config said.
+    """
+    try:
+        from config import MIN_EDGE_CENTS
+        return MIN_EDGE_CENTS / 100.0
+    except ImportError:
+        return 0.05
+
+
 def run_once(cities: list[str] = None, max_spend: float = None,
-             min_edge: float = 0.05):
+             min_edge: float = None):
     """
     Execute one trading run across specified cities.
     Checks kill switch first.
     """
     logger = setup_logging()
+    if min_edge is None:
+        min_edge = default_min_edge()
+
+    pruned = prune_old_logs()
+    if pruned:
+        logger.info(f"Pruned {pruned} log file(s) older than "
+                    f"{LOG_RETENTION_DAYS} days")
 
     logger.info("=" * 50)
     logger.info("SCHEDULED TRADING RUN STARTING")
@@ -448,8 +491,9 @@ Examples:
     run_parser.add_argument("--max-spend", type=float, default=None,
                             help="Optional hard dollar ceiling (default: "
                                  "MAX_RUN_EXPOSURE_PCT of bankroll)")
-    run_parser.add_argument("--min-edge", type=float, default=0.05,
-                            help="Minimum edge to trade (default: 5%%)")
+    run_parser.add_argument("--min-edge", type=float, default=None,
+                            help="Minimum edge to trade (default: "
+                                 "config.MIN_EDGE_CENTS, else 5%%)")
     run_parser.add_argument("--dry-run", action="store_true",
                             help="Simulate without placing orders")
 
@@ -483,32 +527,49 @@ Examples:
     # Handle subcommands
     if args.command == "run":
         if args.dry_run:
-            # Dry run — same budget split as live so numbers are realistic
-            from trader import run_trading_pipeline
+            # Dry run mirrors the LIVE sizing path (global pooled sizing by
+            # default), so paper numbers rehearse the code that trades.
+            dry_min_edge = (args.min_edge if args.min_edge is not None
+                            else default_min_edge())
             dry_cities = args.cities or tradeable_cities()
-            # Dry run simulates a $100 bankroll (see trader.py), so the
-            # default budget mirrors the live percentage sizing.
             try:
-                from config import MAX_RUN_EXPOSURE_PCT as _pct
+                from config import SIZING_MODE as _mode
             except ImportError:
-                _pct = 0.25
-            dry_budget = args.max_spend if args.max_spend is not None else 100.0 * _pct
-            per_city = dry_budget / len(dry_cities)
-            total_spent = 0.0
-            for city in dry_cities:
-                remaining = dry_budget - total_spent
-                city_budget = min(per_city, remaining)
-                if city_budget < 0.50:
-                    print(f"  Skipping {city}: only ${remaining:.2f} remaining")
-                    continue
-                results = run_trading_pipeline(
-                    city_key=city,
+                _mode = "global"
+            if _mode == "per_city":
+                # Legacy even split (the revert path), as before.
+                from trader import run_trading_pipeline
+                try:
+                    from config import MAX_RUN_EXPOSURE_PCT as _pct
+                except ImportError:
+                    _pct = 0.25
+                dry_budget = (args.max_spend if args.max_spend is not None
+                              else 100.0 * _pct)
+                per_city = dry_budget / len(dry_cities)
+                total_spent = 0.0
+                for city in dry_cities:
+                    remaining = dry_budget - total_spent
+                    city_budget = min(per_city, remaining)
+                    if city_budget < 0.50:
+                        print(f"  Skipping {city}: only ${remaining:.2f} remaining")
+                        continue
+                    results = run_trading_pipeline(
+                        city_key=city,
+                        dry_run=True,
+                        max_spend=city_budget,
+                        min_edge=dry_min_edge,
+                        tomorrow_only=True,
+                    )
+                    total_spent += sum(r.order.cost_dollars for r in results if r.success)
+            else:
+                from trader import run_global_pipeline
+                run_global_pipeline(
+                    city_keys=dry_cities,
                     dry_run=True,
-                    max_spend=city_budget,
-                    min_edge=args.min_edge,
+                    min_edge=dry_min_edge,
                     tomorrow_only=True,
+                    max_spend=args.max_spend,
                 )
-                total_spent += sum(r.order.cost_dollars for r in results if r.success)
         else:
             run_once(cities=args.cities, max_spend=args.max_spend,
                      min_edge=args.min_edge)

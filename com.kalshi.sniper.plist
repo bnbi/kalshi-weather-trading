@@ -14,8 +14,8 @@
         <string>/Users/YOUR_USERNAME/kalshi-bot/sniper.py</string>
         <string>run</string>
         <string>--auto</string>
-        <string>--budget</string>
-        <string>6</string>
+        <!-- Budget is percentage-of-bankroll (config: MAX_RUN_EXPOSURE_PCT).
+             Add "--budget N" back only as a deliberate hard dollar ceiling. -->
     </array>
 
     <key>WorkingDirectory</key>

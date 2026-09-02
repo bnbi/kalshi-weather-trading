@@ -20,7 +20,7 @@ Two sources, in order of preference:
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -33,7 +33,7 @@ from weather import CITIES
 
 NCEI_URL = "https://www.ncei.noaa.gov/access/services/data/v1"
 NWS_BASE = "https://api.weather.gov"
-HEADERS = {"User-Agent": "(kalshi-weather-bot, contact@example.com)"}
+HEADERS = {"User-Agent": "(kalshi-weather-bot, github.com/bnbi/kalshi-weather-trading)"}
 
 # Station identifiers for each city's Kalshi settlement location
 STATIONS = {
@@ -122,6 +122,52 @@ def fetch_nws_station_high(city_key: str, date: str) -> float | None:
         return None
 
     return round(max(temps_c) * 9 / 5 + 32, 1)
+
+
+def get_observed_max(city_key: str, local_date: str) -> dict | None:
+    """
+    Running max temperature so far today at the settlement station.
+    Returns {'obs_max_f', 'n_obs', 'last_obs'} or None if unavailable.
+
+    Unlike fetch_nws_station_high (a full-day max for verification), this is
+    meant for INTRADAY use: it accepts partial days (>= 3 observations).
+    """
+    station = STATIONS[city_key]["nws"]
+    tz = ZoneInfo(CITIES[city_key].timezone)
+    midnight_local = datetime.strptime(local_date, "%Y-%m-%d").replace(tzinfo=tz)
+    start = midnight_local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    try:
+        resp = requests.get(
+            f"{NWS_BASE}/stations/{station}/observations",
+            params={"start": start, "limit": 200},
+            headers={**HEADERS, "Accept": "application/geo+json"},
+            timeout=15)
+        resp.raise_for_status()
+        features = resp.json().get("features", [])
+    except Exception as e:
+        print(f"  [{city_key}] obs fetch failed: {e}")
+        return None
+
+    temps_f, last_obs = [], None
+    for f in features:
+        props = f.get("properties", {})
+        t = (props.get("temperature") or {}).get("value")
+        ts = props.get("timestamp")
+        if t is None or ts is None:
+            continue
+        # Only count observations whose LOCAL date matches the target date
+        obs_local = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(tz)
+        if obs_local.strftime("%Y-%m-%d") != local_date:
+            continue
+        temps_f.append(t * 9 / 5 + 32)
+        if last_obs is None or ts > last_obs:
+            last_obs = ts
+
+    if len(temps_f) < 3:
+        return None
+
+    return {"obs_max_f": max(temps_f), "n_obs": len(temps_f), "last_obs": last_obs}
 
 
 def fetch_station_daily_high(city_key: str, date: str) -> float | None:

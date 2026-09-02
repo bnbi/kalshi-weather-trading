@@ -34,6 +34,9 @@ import weatherkit
 BOT_DIR = Path(__file__).parent
 DB_PATH = BOT_DIR / "kalshi_data.db"
 
+# How many recent unverified days each learning cycle tries to catch up on.
+VERIFY_LOOKBACK_DAYS = 7
+
 
 # ── Database setup ─────────────────────────────────────────────────
 
@@ -62,10 +65,14 @@ def init_prediction_log(conn: sqlite3.Connection) -> None:
     # Extra forecast sources added after the table was first created.
     # ICON was previously only backfilled into historical_forecasts, so
     # live-collected rows lost it; both are now logged here every run.
-    for col in ["icon_forecast_f", "icon_error",
-                "wk_forecast_f", "wk_error"]:
+    for col in ["icon_forecast_f REAL", "icon_error REAL",
+                "wk_forecast_f REAL", "wk_error REAL",
+                # Where actual_high_f came from: 'station' (settlement truth)
+                # or 'era5' (reanalysis fallback, can differ by 1-3°F).
+                # The sniper's validation gate only trusts station rows.
+                "actual_source TEXT"]:
         try:
-            conn.execute(f"ALTER TABLE daily_predictions ADD COLUMN {col} REAL")
+            conn.execute(f"ALTER TABLE daily_predictions ADD COLUMN {col}")
             conn.commit()
         except sqlite3.OperationalError:
             pass  # column already exists
@@ -151,6 +158,8 @@ def record_forecasts(conn: sqlite3.Connection, city_key: str,
             dt = datetime.strptime(target_date, "%Y-%m-%d")
             result = predict_with_trained_model(
                 gfs=gfs, ecmwf=ecmwf, blend=blend, icon=icon,
+                weatherkit=wk,   # keep this recorded prediction on the same
+                                 # inputs the live pipeline uses
                 month=dt.month,
                 day_of_year=dt.timetuple().tm_yday,
                 model_path=model_path,
@@ -212,10 +221,12 @@ def verify_yesterday(conn: sqlite3.Connection, city_key: str,
     # the number Kalshi settles on), ERA5 reanalysis only as a fallback.
     print(f"  [{city_key}] Fetching actual high for {check_date}...")
     actual = None
+    actual_source = None
     try:
         from station_obs import fetch_station_daily_high
         actual = fetch_station_daily_high(city_key, check_date)
         if actual is not None:
+            actual_source = "station"
             print(f"    (official station reading)")
     except Exception as e:
         print(f"    Station obs failed: {e}")
@@ -225,6 +236,7 @@ def verify_yesterday(conn: sqlite3.Connection, city_key: str,
             actuals = fetch_actual_temps(city, check_date, check_date)
             actual = actuals.get(check_date)
             if actual is not None:
+                actual_source = "era5"
                 print(f"    WARNING: using ERA5 fallback — may differ "
                       f"from settlement station")
         except Exception as e:
@@ -247,6 +259,7 @@ def verify_yesterday(conn: sqlite3.Connection, city_key: str,
     conn.execute("""
         UPDATE daily_predictions SET
             actual_high_f = ?,
+            actual_source = ?,
             model_error = ?,
             gfs_error = ?,
             ecmwf_error = ?,
@@ -255,8 +268,8 @@ def verify_yesterday(conn: sqlite3.Connection, city_key: str,
             wk_error = ?,
             verified_at = ?
         WHERE date = ? AND city = ?
-    """, (actual, model_err, gfs_err, ecmwf_err, blend_err, icon_err, wk_err,
-          now, check_date, city_key))
+    """, (actual, actual_source, model_err, gfs_err, ecmwf_err, blend_err,
+          icon_err, wk_err, now, check_date, city_key))
     conn.commit()
 
     print(f"    Actual: {actual}°F")
@@ -403,21 +416,27 @@ def run_daily_learning(cities: list[str] = None) -> None:
     init_historical_tables(conn)
 
     today = datetime.now().strftime("%Y-%m-%d")
-    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
 
     print(f"\n{'=' * 60}")
     print(f"  DAILY LEARNING CYCLE — {today}")
     print(f"{'=' * 60}")
 
-    # Step 1: Verify yesterday
-    print(f"\n--- Verifying yesterday's predictions ({yesterday}) ---")
+    # Step 1: Verify recent unverified days (not just yesterday — if the
+    # machine was off for a day, that date previously stayed unverified
+    # forever, silently starving live calibration and the sniper gate).
+    print(f"\n--- Verifying recent unverified predictions ---")
     any_new_data = False
     for city in cities:
-        result = verify_yesterday(conn, city, yesterday)
-        if result and not result.get("already_done"):
-            added = add_to_training_data(conn, city, yesterday)
-            if added:
-                any_new_data = True
+        pending = conn.execute("""
+            SELECT date FROM daily_predictions
+            WHERE city = ? AND actual_high_f IS NULL AND date < ?
+            ORDER BY date DESC LIMIT ?
+        """, (city, today, VERIFY_LOOKBACK_DAYS)).fetchall()
+        for (check_date,) in pending:
+            result = verify_yesterday(conn, city, check_date)
+            if result and not result.get("already_done"):
+                if add_to_training_data(conn, city, check_date):
+                    any_new_data = True
 
     # Step 2: Retrain if we got new data
     if any_new_data:
@@ -592,13 +611,19 @@ Commands:
         conn = sqlite3.connect(str(DB_PATH))
         init_prediction_log(conn)
         init_historical_tables(conn)
-        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        today = datetime.now().strftime("%Y-%m-%d")
         any_new = False
         for city in (cities or list(CITIES.keys())):
-            result = verify_yesterday(conn, city, yesterday)
-            if result and not result.get("already_done"):
-                if add_to_training_data(conn, city, yesterday):
-                    any_new = True
+            pending = conn.execute("""
+                SELECT date FROM daily_predictions
+                WHERE city = ? AND actual_high_f IS NULL AND date < ?
+                ORDER BY date DESC LIMIT ?
+            """, (city, today, VERIFY_LOOKBACK_DAYS)).fetchall()
+            for (check_date,) in pending:
+                result = verify_yesterday(conn, city, check_date)
+                if result and not result.get("already_done"):
+                    if add_to_training_data(conn, city, check_date):
+                        any_new = True
         if any_new:
             for city in (cities or list(CITIES.keys())):
                 retrain_model(conn, city)
