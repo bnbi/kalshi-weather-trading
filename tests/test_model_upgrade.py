@@ -883,10 +883,13 @@ def test_sniper_verify_ignores_era5_truth(tmp_path):
     conn.execute("""CREATE TABLE daily_predictions
                     (date TEXT, city TEXT, actual_high_f REAL,
                      actual_source TEXT)""")
+    # Older than the exchange-lookup window (21d) but younger than the
+    # 120-day void cutoff, so only the station path is exercised.
+    day = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
     conn.execute("""INSERT INTO sniper_signals
         (created_at,date,city,ticker,side,prob,ask_price,mode)
-        VALUES('x','2026-07-01','nyc','KXHIGHNY-26JUL01-B88.5','no',0.9,0.80,'dry')""")
-    conn.execute("INSERT INTO daily_predictions VALUES('2026-07-01','nyc',91.0,'era5')")
+        VALUES('x',?,'nyc','KXHIGHNY-26JUL01-B88.5','no',0.9,0.80,'dry')""", (day,))
+    conn.execute("INSERT INTO daily_predictions VALUES(?,'nyc',91.0,'era5')", (day,))
     conn.commit()
     assert sniper.verify_signals(conn) == 0
     assert conn.execute(
@@ -1243,13 +1246,15 @@ def test_sniper_verify_prefers_exchange_result_and_grades_below_thresholds(tmp_p
     conn.execute("""CREATE TABLE daily_predictions
                     (date TEXT, city TEXT, actual_high_f REAL, actual_source TEXT)""")
     # "<80" threshold, official high 85 -> YES loses, so a NO signal WINS
+    # Recent enough that the exchange lookup is attempted (21-day window).
+    day = (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%d")
     conn.execute("""INSERT INTO sniper_signals
         (created_at,date,city,ticker,side,prob,ask_price,mode,strike_type)
-        VALUES('x','2026-08-20','nyc','KXHIGHNY-26AUG20-T80','no',0.9,0.80,'dry','less')""")
+        VALUES('x',?,'nyc','KXHIGHNY-26AUG20-T80','no',0.9,0.80,'dry','less')""", (day,))
     conn.execute("""INSERT INTO sniper_signals
         (created_at,date,city,ticker,side,prob,ask_price,mode)
-        VALUES('x','2026-08-20','nyc','KXHIGHNY-26AUG20-B88.5','no',0.9,0.70,'dry')""")
-    conn.execute("INSERT INTO daily_predictions VALUES('2026-08-20','nyc',85.0,'station')")
+        VALUES('x',?,'nyc','KXHIGHNY-26AUG20-B88.5','no',0.9,0.70,'dry')""", (day,))
+    conn.execute("INSERT INTO daily_predictions VALUES(?,'nyc',85.0,'station')", (day,))
     conn.commit()
 
     class FakeClient:
