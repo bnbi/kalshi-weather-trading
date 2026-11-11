@@ -710,6 +710,15 @@ def _gather_signals(city_key: str, min_edge: float,
         except Exception as e:
             print(f"  Warning: could not log skipped signals: {e}")
 
+    quotes = getattr(calculate_edge, "last_quotes", [])
+    if quotes:
+        try:
+            from pnl_tracker import log_quotes
+            n_q = log_quotes(quotes)
+            print(f"  Logged {n_q} decision-time quote(s)")
+        except Exception as e:
+            print(f"  Warning: could not log quotes: {e}")
+
     if tomorrow_only and signals:
         pre_filter = list(signals)
         signals = filter_tomorrow_only(signals, city.timezone)

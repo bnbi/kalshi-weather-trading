@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from weather import CITIES
-from model import predict_all_for_city, ContractPrediction
+from model import predict_all_for_city, ContractPrediction, parse_contract_ticker
 
 
 BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
@@ -94,6 +94,8 @@ def calculate_edge(predictions: list[ContractPrediction],
     # Reset the counterfactual log up front so a mid-function exception can
     # never leave a previous call's skips visible to the caller.
     calculate_edge.last_skipped = []
+    calculate_edge.last_quotes = []
+    series_to_city = {c.kalshi_series: key for key, c in CITIES.items()}
 
     # Build a lookup of market prices by ticker
     market_lookup = {}
@@ -148,6 +150,7 @@ def calculate_edge(predictions: list[ContractPrediction],
 
     signals = []
     skipped = []
+    quotes = []
 
     for pred in predictions:
         market = market_lookup.get(pred.ticker)
@@ -181,6 +184,20 @@ def calculate_edge(predictions: list[ContractPrediction],
             prior_yes, prior_no = yes_ask, no_ask
         yes_blend_prob = MODEL_WEIGHT * pred.model_probability + (1 - MODEL_WEIGHT) * prior_yes
         no_blend_prob = MODEL_WEIGHT * (1 - pred.model_probability) + (1 - MODEL_WEIGHT) * prior_no
+
+        # Decision-time quote record for every market we price, whether or
+        # not it signals. Spread and market-efficiency drift can only be
+        # measured against the asks we actually saw, and σ / filter changes
+        # can only be backtested against them.
+        parsed = parse_contract_ticker(pred.ticker)
+        quotes.append({
+            "ticker": pred.ticker,
+            "date": parsed.get("date"),
+            "city": series_to_city.get(parsed.get("series")),
+            "yes_bid": yes_bid, "yes_ask": yes_ask, "no_ask": no_ask,
+            "model_prob": pred.model_probability,
+            "blended_yes": yes_blend_prob, "blended_no": no_blend_prob,
+        })
         # Edges are net of Kalshi's trading fee — a thin gross edge that
         # doesn't cover the fee is a losing trade, not a marginal one.
         yes_edge = yes_blend_prob - yes_ask - kalshi_fee_per_contract(yes_ask)
@@ -251,6 +268,7 @@ def calculate_edge(predictions: list[ContractPrediction],
     # Expose filtered candidates for counterfactual logging (attribute keeps
     # the return signature stable for existing callers).
     calculate_edge.last_skipped = skipped
+    calculate_edge.last_quotes = quotes
     return signals
 
 

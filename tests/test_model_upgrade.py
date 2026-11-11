@@ -556,6 +556,69 @@ def test_price_floor_skips_are_recorded():
     assert floor[0]["ask_price"] == pytest.approx(0.49)
 
 
+def test_quotes_are_recorded_for_every_priced_market():
+    """calculate_edge exposes a decision-time quote for each market it
+    priced (signal or not), with city/date parsed from the ticker; markets
+    with a missing ask are not priced and so not recorded."""
+    a = _pred_for_skip("KXHIGHDEN-26NOV12-T60", 0.40)
+    b = _pred_for_skip("KXHIGHNY-26NOV12-B55.5", 0.20, ctype="bracket")
+    c = _pred_for_skip("KXHIGHMIA-26NOV12-T80", 0.50)
+    markets = [
+        {"ticker": a.ticker, "yes_bid_dollars": "0.38", "yes_ask_dollars": "0.42",
+         "no_ask_dollars": "0.60", "title": "high > 60"},
+        {"ticker": b.ticker, "yes_ask_dollars": "0.25",
+         "no_ask_dollars": "0.77", "title": "55-56"},          # no bid quoted
+        {"ticker": c.ticker, "no_ask_dollars": "0.50", "title": "high > 80"},  # no yes ask
+    ]
+    find_edge.calculate_edge([a, b, c], markets, min_edge=0.05)
+    quotes = find_edge.calculate_edge.last_quotes
+    assert [q["ticker"] for q in quotes] == [a.ticker, b.ticker]
+    qa = quotes[0]
+    assert qa["city"] == "denver" and qa["date"] == "2026-11-12"
+    assert qa["yes_bid"] == pytest.approx(0.38)
+    assert qa["yes_ask"] == pytest.approx(0.42)
+    assert qa["no_ask"] == pytest.approx(0.60)
+    assert qa["model_prob"] == pytest.approx(0.40)
+    mid = (0.38 + 0.42) / 2
+    w = 0.5  # find_edge.calculate_edge's MODEL_WEIGHT (local constant)
+    assert qa["blended_yes"] == pytest.approx(w * 0.40 + (1 - w) * mid)
+    assert qa["blended_no"] == pytest.approx(w * 0.60 + (1 - w) * (1 - mid))
+    qb = quotes[1]
+    assert qb["yes_bid"] is None
+    assert qb["blended_yes"] == pytest.approx(w * 0.20 + (1 - w) * 0.25)
+
+
+def test_quotes_reset_between_calls():
+    a = _pred_for_skip("KXHIGHDEN-26NOV12-T60", 0.40)
+    markets = [{"ticker": a.ticker, "yes_ask_dollars": "0.42",
+                "no_ask_dollars": "0.60", "title": "high > 60"}]
+    find_edge.calculate_edge([a], markets, min_edge=0.05)
+    assert len(find_edge.calculate_edge.last_quotes) == 1
+    find_edge.calculate_edge([], [], min_edge=0.05)
+    assert find_edge.calculate_edge.last_quotes == []
+
+
+def test_log_quotes_appends_rows(tmp_path):
+    import pnl_tracker as pt
+    conn = sqlite3.connect(tmp_path / "pnl.db")
+    pt.init_pnl_tables(conn)
+    rows = [{"ticker": "KXHIGHDEN-26NOV12-T60", "date": "2026-11-12",
+             "city": "denver", "yes_bid": 0.38, "yes_ask": 0.42, "no_ask": 0.60,
+             "model_prob": 0.40, "blended_yes": 0.39, "blended_no": 0.61},
+            {"ticker": "KXHIGHNY-26NOV12-B55.5", "date": "2026-11-12",
+             "city": "nyc", "yes_bid": None, "yes_ask": 0.25, "no_ask": 0.77,
+             "model_prob": 0.20, "blended_yes": 0.225, "blended_no": 0.775}]
+    assert pt.log_quotes([], conn) == 0
+    assert pt.log_quotes(rows, conn) == 2
+    assert pt.log_quotes(rows, conn) == 2          # a new pass is a new batch
+    got = conn.execute("SELECT count(*), count(DISTINCT issued_at) FROM quote_log").fetchone()
+    assert got[0] == 4 and got[1] >= 1
+    r = conn.execute("SELECT city, yes_bid, yes_ask, blended_no FROM quote_log "
+                     "WHERE ticker LIKE 'KXHIGHNY%' ORDER BY id LIMIT 1").fetchone()
+    assert r == ("nyc", None, 0.25, 0.775)
+    conn.close()
+
+
 def test_skipped_signals_log_and_verify(tmp_path, monkeypatch):
     import pnl_tracker as pt
     conn = sqlite3.connect(tmp_path / "pnl.db")

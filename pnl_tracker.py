@@ -134,6 +134,31 @@ def init_pnl_tables(conn: sqlite3.Connection) -> None:
     """)
     conn.commit()
 
+    # Decision-time quotes for every market the edge finder priced, one
+    # batch per run. Lets spread / efficiency drift be measured and σ or
+    # filter changes be backtested against the asks that were actually
+    # available. Append-only; nothing reads it on the trading path.
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS quote_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            issued_at TEXT NOT NULL,       -- UTC ISO timestamp of the pricing pass
+            ticker TEXT NOT NULL,
+            date TEXT,                     -- market (target) local date
+            city TEXT,                     -- city key, e.g. 'denver'
+            yes_bid REAL,
+            yes_ask REAL,
+            no_ask REAL,
+            model_prob REAL,               -- raw model P(YES)
+            blended_yes REAL,              -- model/market blend, YES side
+            blended_no REAL                -- model/market blend, NO side
+        );
+        CREATE INDEX IF NOT EXISTS idx_quote_log_ticker
+            ON quote_log(ticker);
+        CREATE INDEX IF NOT EXISTS idx_quote_log_date_city
+            ON quote_log(date, city);
+    """)
+    conn.commit()
+
 
 # ── Trade logging ──────────────────────────────────────────────────
 
@@ -804,6 +829,33 @@ def log_skipped_signals(skips: list, conn: sqlite3.Connection = None) -> int:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (now, s["ticker"], s["side"], s["reason"], s["model_prob"],
               s["ask_price"], s["raw_gap"], s["edge"]))
+        n += cur.rowcount
+    conn.commit()
+    if close_after:
+        conn.close()
+    return n
+
+
+def log_quotes(rows: list, conn: sqlite3.Connection = None) -> int:
+    """Append decision-time quotes (from find_edge) for every priced market.
+    One issued_at per call; no dedupe — each pricing pass is its own batch."""
+    if not rows:
+        return 0
+    close_after = conn is None
+    if conn is None:
+        conn = sqlite3.connect(str(DB_PATH))
+    init_pnl_tables(conn)
+    now = datetime.now(timezone.utc).isoformat()
+    n = 0
+    for q in rows:
+        cur = conn.execute("""
+            INSERT INTO quote_log
+            (issued_at, ticker, date, city, yes_bid, yes_ask, no_ask,
+             model_prob, blended_yes, blended_no)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (now, q["ticker"], q.get("date"), q.get("city"),
+              q.get("yes_bid"), q.get("yes_ask"), q.get("no_ask"),
+              q.get("model_prob"), q.get("blended_yes"), q.get("blended_no")))
         n += cur.rowcount
     conn.commit()
     if close_after:
