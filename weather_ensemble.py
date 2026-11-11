@@ -152,8 +152,11 @@ class EnsembleForecast:
 
     # Floor when live verified errors ARE available. Live next-day error std
     # measured over May-Sep 2026 was 1.9-2.6°F per city, so we allow σ to
-    # tighten below 2.5 — but never below this.
-    MIN_LIVE_STD = 1.8
+    # tighten below 2.5 — but never below this. Lowered 1.8 → 1.5 (Nov 2026):
+    # the 1.8 floor was binding NYC/MIA whose live σ runs ~1.45, and the
+    # Sep–Nov calibration audit (n=460) measured z_rms 0.83 — σ was ~20%
+    # too wide across six of seven cities.
+    MIN_LIVE_STD = 1.5
 
     # Live bias correction is clipped to this range (°F). Now that the live
     # window uses OFFICIAL actuals and the current model, a wider clip is
@@ -223,9 +226,17 @@ class EnsembleForecast:
                 correction = max(-max_bias, min(max_bias, bias))
                 self.bias_applied_f = round(correction, 2)
                 self.ensemble_high_f = round(self.raw_pred_f - correction, 1)
-                base_std = max(live_std, ml_result["uncertainty_std"], self.MIN_LIVE_STD)
-                self.sigma_source = (f"max(live σ {live_std:.2f} over {n_live}d, "
-                                     f"model σ {ml_result['uncertainty_std']:.2f})")
+                # RMS-blend the two σ estimates instead of taking their max.
+                # max() of two noisy estimates is biased high by construction
+                # (it always picks whichever one errs upward); the audit
+                # showed realized RMSE 2.13°F against a mean σ of 2.58°F.
+                # The half-step blend keeps the floor as the only hard clamp.
+                model_std = ml_result["uncertainty_std"]
+                blend_std = ((live_std ** 2 + model_std ** 2) / 2) ** 0.5
+                base_std = max(blend_std, self.MIN_LIVE_STD)
+                self.sigma_source = (f"rms(live σ {live_std:.2f} over {n_live}d, "
+                                     f"model σ {model_std:.2f}) = {blend_std:.2f}, "
+                                     f"floor {self.MIN_LIVE_STD}")
             else:
                 # No live data — fall back to the conservative floor.
                 base_std = max(ml_result["uncertainty_std"], self.MIN_UNCERTAINTY_STD)

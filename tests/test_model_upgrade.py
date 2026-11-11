@@ -1225,9 +1225,45 @@ def test_ensemble_sigma_no_spread_stacking_with_day_sigma(monkeypatch):
     monkeypatch.setattr(we.EnsembleForecast, "_apply_weatherkit_blend", lambda self: None)
     ens.compute()
     assert ens.model_spread == 8.0
-    assert ens.ensemble_std == pytest.approx(2.4)      # max(2.0, 2.4, 1.8), no +2.0
+    # rms(live 2.0, model 2.4) = sqrt((4.0 + 5.76) / 2) = 2.209; no +2.0 spread
+    assert ens.ensemble_std == pytest.approx(2.209, abs=1e-3)
     assert ens.ensemble_high_f == pytest.approx(81.5)  # raw 82 minus +0.5 bias
     assert ens.bias_applied_f == pytest.approx(0.5)
+
+
+def test_ensemble_sigma_rms_blend_and_floor(monkeypatch):
+    """σ is the RMS of live σ and model σ (never their max), clamped at
+    MIN_LIVE_STD = 1.5 from below."""
+    import weather_ensemble as we
+    assert we.EnsembleForecast.MIN_LIVE_STD == pytest.approx(1.5)
+
+    def _run(live_std, model_std):
+        ens = we.EnsembleForecast(city="New York", date="2026-11-12")
+        ens.sources = [we.ForecastSource("OpenMeteo/gfs", 50.0),
+                       we.ForecastSource("OpenMeteo/ecmwf", 51.0)]
+        monkeypatch.setattr(we.EnsembleForecast, "_predict_with_trained_model",
+                            lambda self: {"predicted_high": 50.5,
+                                          "uncertainty_std": model_std,
+                                          "has_sigma_model": True, "features": {},
+                                          "trained_date": "x"})
+        monkeypatch.setattr(we.EnsembleForecast, "_get_live_calibration",
+                            lambda self: (0.0, live_std, 30))
+        monkeypatch.setattr(we.EnsembleForecast, "_apply_weatherkit_blend",
+                            lambda self: None)
+        ens.compute()
+        return ens
+
+    # Typical NYC: live 1.45, model 2.1 → rms 1.805 (old max() gave 2.1)
+    e = _run(1.45, 2.1)
+    assert e.ensemble_std == pytest.approx(((1.45**2 + 2.1**2) / 2) ** 0.5, abs=1e-3)
+    assert e.ensemble_std < 2.1
+    assert e.sigma_source.startswith("rms(")
+    # Both estimates below the floor → floor binds
+    e = _run(1.2, 1.3)
+    assert e.ensemble_std == pytest.approx(1.5)
+    # Denver-like: live 2.3, model 3.2 → 2.787
+    e = _run(2.3, 3.2)
+    assert e.ensemble_std == pytest.approx(2.787, abs=1e-3)
 
 
 def test_la_ecmwf_is_excluded_everywhere():
