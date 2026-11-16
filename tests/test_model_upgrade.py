@@ -877,12 +877,13 @@ def test_stale_resting_order_is_canceled(tmp_path):
     resting = {"status": "resting", "fill_count_fp": "0.00",
                "taker_fill_cost_dollars": "0", "maker_fill_cost_dollars": "0",
                "taker_fees_dollars": "0", "maker_fees_dollars": "0"}
+    canceled = {**resting, "status": "canceled"}
 
     class FakeClient:
         def __init__(self):
             self.canceled = []
         def get_order(self, oid):
-            return {"order": dict(resting)}
+            return {"order": dict(canceled if oid in self.canceled else resting)}
         def cancel_order(self, oid):
             self.canceled.append(oid)
             return {}
@@ -896,6 +897,38 @@ def test_stale_resting_order_is_canceled(tmp_path):
     # fresh resting order left alone (still excluded from scoring)
     assert conn.execute(
         "SELECT filled_contracts FROM trades WHERE ticker='T-NEW'").fetchone()[0] == 0
+
+
+def test_stale_order_cancel_failure_keeps_row_for_retry(tmp_path):
+    """If cancel_order raises (mutations deliberately don't retry), the
+    order may still be resting on the book — the row must survive with
+    filled_contracts=0 rather than being deleted out from under a live
+    order (exposure/scoring would silently drop it)."""
+    import pnl_tracker as pt
+    conn = sqlite3.connect(tmp_path / "pnl.db")
+    pt.init_pnl_tables(conn)
+    pt.log_trade(conn, "T-OLD", "no", "buy", 4, 70, 2.80, order_id="ord-old")
+    old_ts = (datetime.utcnow()
+              - timedelta(hours=pt.STALE_ORDER_HOURS + 1)).isoformat() + "+00:00"
+    conn.execute("UPDATE trades SET timestamp=? WHERE ticker='T-OLD'", (old_ts,))
+    conn.commit()
+
+    resting = {"status": "resting", "fill_count_fp": "0.00",
+               "taker_fill_cost_dollars": "0", "maker_fill_cost_dollars": "0",
+               "taker_fees_dollars": "0", "maker_fees_dollars": "0"}
+
+    class FakeClient:
+        def get_order(self, oid):
+            return {"order": dict(resting)}
+        def cancel_order(self, oid):
+            raise RuntimeError("timeout")
+
+    client = FakeClient()
+    pt.reconcile_fills(conn, client=client)
+    row = conn.execute(
+        "SELECT filled_contracts FROM trades WHERE ticker='T-OLD'").fetchone()
+    assert row is not None
+    assert row[0] == 0
 
 
 def test_blend_prior_uses_mid_when_bid_available():

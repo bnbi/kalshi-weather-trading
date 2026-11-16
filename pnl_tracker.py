@@ -278,12 +278,6 @@ def reconcile_fills(conn: sqlite3.Connection, client=None) -> int:
                         + float(o2.get("maker_fees_dollars") or 0)) or fees
             except Exception:
                 pass
-            if filled == 0:
-                # Nothing ever filled — remove the phantom row now rather
-                # than waiting for the next pass to see the canceled state.
-                conn.execute("DELETE FROM trades WHERE id = ?", (tid,))
-                adjusted += 1
-                continue
 
         if filled == 0:
             if status in TERMINAL_ORDER_STATUSES:
