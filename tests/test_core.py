@@ -72,6 +72,27 @@ def test_parse_unknown_ticker():
     assert model.parse_contract_ticker("garbage")["type"] == "unknown"
 
 
+def test_parse_negative_strike_tickers():
+    # Sub-zero winter strikes carry a minus sign inside the strike segment;
+    # the ticker split must not treat it as another separator.
+    info = model.parse_contract_ticker("KXHIGHDEN-26JAN05-T-5")
+    assert info["type"] == "threshold"
+    assert info["threshold"] == -5.0
+    assert info["date"] == "2026-01-05"
+
+    info = model.parse_contract_ticker("KXHIGHCHI-26JAN05-B-0.5")
+    assert info["type"] == "bracket"
+    assert info["bracket_low"] == -1.0
+    assert info["bracket_high"] == 0.0
+
+
+def test_parse_bad_strike_returns_unknown_not_raise():
+    # A malformed strike degrades to "unknown" (callers skip it) instead of
+    # raising out of the parse.
+    assert model.parse_contract_ticker("KXHIGHCHI-26MAY05-TX")["type"] == "unknown"
+    assert model.parse_contract_ticker("KXHIGHCHI-26MAY05-Bx.5")["type"] == "unknown"
+
+
 # ── Probability model ───────────────────────────────────────────────
 
 def _ncdf(x, mu, sd):

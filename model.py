@@ -51,13 +51,16 @@ def parse_contract_ticker(ticker: str) -> dict:
     The T contracts are "above" if the title says ">X" and "below" if "<X".
     The B contracts are brackets: B83.5 means 83-84, B81.5 means 81-82, etc.
     """
-    parts = ticker.split("-")
+    # maxsplit=2 keeps a minus sign inside the strike intact: a sub-zero
+    # winter strike like T-5 or B-0.5 would otherwise split into a bare
+    # "T"/"B" and an orphaned number.
+    parts = ticker.split("-", 2)
     if len(parts) < 3:
         return {"type": "unknown", "ticker": ticker}
 
     series = parts[0]        # e.g. KXHIGHCHI
     date_str = parts[1]      # e.g. 26MAY05
-    strike = parts[2]        # e.g. T65 or B64.5
+    strike = parts[2]        # e.g. T65, B64.5, or T-5 / B-0.5 below zero
 
     # Parse date: 26MAY05 -> 2026-05-05
     year = f"20{date_str[:2]}"
@@ -74,7 +77,11 @@ def parse_contract_ticker(ticker: str) -> dict:
     date = f"{year}-{month}-{day}"
 
     if strike.startswith("T"):
-        threshold = float(strike[1:])
+        try:
+            threshold = float(strike[1:])
+        except ValueError:
+            return {"type": "unknown", "series": series, "date": date,
+                    "ticker": ticker}
         return {
             "type": "threshold",
             "series": series,
@@ -83,7 +90,11 @@ def parse_contract_ticker(ticker: str) -> dict:
             "ticker": ticker,
         }
     elif strike.startswith("B"):
-        center = float(strike[1:])
+        try:
+            center = float(strike[1:])
+        except ValueError:
+            return {"type": "unknown", "series": series, "date": date,
+                    "ticker": ticker}
         # B83.5 means the bracket 83-84 (center ± 0.5, so range is center-0.5 to center+0.5)
         return {
             "type": "bracket",
